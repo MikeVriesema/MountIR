@@ -1,0 +1,1042 @@
+#!/usr/bin/env python3
+r"""
+    __  ___                  __  ________
+   /  |/  /___  __  ______  / /_/  _/ __ \
+  / /|_/ / __ \/ / / / __ \/ __// // /_/ /
+ / /  / / /_/ / /_/ / / / / /__/ // _, _/
+/_/  /_/\____/\__,_/_/ /_/\__/___/_/ |_|
+
+MountIR - Forensic Disk Image Mounting Utility
+"""
+
+MOUNTIR_VERSION = "1.0.0"
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+from datetime import datetime
+from pathlib import Path
+
+# Ensure script directory is on the path for local imports
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+from utils import (
+    logger, setup_logging, check_root, generate_mount_id,
+    ensure_mount_dir, cleanup_mount_dir, format_bytes, run_command,
+    find_mounts_under, loop_devices_backing,
+    Fore, Style, HAS_COLOR,
+)
+from detector import ImageType, detect_image_type, SUPPORTED_FORMATS
+from handlers import get_handler, ALL_HANDLER_CLASSES, NO_PARTITION_TYPES
+from handlers.base import MountResult
+from partition import (
+    expose_partitions, mount_partition, unmount_partitions,
+    detect_lvm, activate_lvm, deactivate_lvm,
+    infer_os, PartitionInfo, _enrich_with_blkid,
+)
+from state import StateManager, MountedImage, MountedPartition
+import zfs
+import bootstrap
+
+
+# ---------------------------------------------------------------------------
+# Banner
+# ---------------------------------------------------------------------------
+BANNER = r"""
+    __  ___                  __  ________
+   /  |/  /___  __  ______  / /_/  _/ __ \
+  / /|_/ / __ \/ / / / __ \/ __// // /_/ /
+ / /  / / /_/ / /_/ / / / / /__/ // _, _/
+/_/  /_/\____/\__,_/_/ /_/\__/___/_/ |_|
+"""
+
+
+def print_banner():
+    """Print the MountIR banner to stderr."""
+    version_line = f"  MountIR v{MOUNTIR_VERSION} - Forensic Disk Image Mounting"
+
+    if HAS_COLOR:
+        print(f"{Fore.CYAN}{BANNER}{Style.RESET_ALL}", file=sys.stderr)
+        print(f"{Fore.WHITE}{Style.BRIGHT}{version_line}{Style.RESET_ALL}\n",
+              file=sys.stderr)
+    else:
+        print(BANNER, file=sys.stderr)
+        print(f"{version_line}\n", file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
+# Command: mount
+# ---------------------------------------------------------------------------
+def cmd_mount(args):
+    """Mount a forensic disk image."""
+    # Handle JSON input mode (Whirlpool integration)
+    if args.json_input:
+        _apply_json_input(args)
+
+    # Root check
+    if not check_root():
+        logger.error("MountIR requires root privileges. Run with sudo.")
+        sys.exit(1)
+
+    # Resolve image path
+    image_path = Path(args.image_path).resolve()
+    if not image_path.exists():
+        logger.error("Image not found: %s", image_path)
+        sys.exit(1)
+
+    # Detect image type
+    image_type = detect_image_type(image_path)
+    if image_type == ImageType.UNKNOWN:
+        logger.error("Unrecognized image format: %s", image_path)
+        logger.error("Supported formats: %s", SUPPORTED_FORMATS)
+        sys.exit(1)
+    logger.info("Detected image type: %s", image_type.value.upper())
+
+    # Get handler and check tools
+    handler = get_handler(image_type)
+    tool_status = handler.check_tools()
+    if not tool_status["usable"]:
+        logger.error(
+            "Missing required tools for %s: %s",
+            handler.format_name, ", ".join(tool_status["missing"]),
+        )
+        logger.error("Install dependencies with: mountir setup")
+        sys.exit(1)
+    if tool_status.get("fallback_in_use"):
+        logger.info("Using fallback tools for %s", handler.format_name)
+
+    # Create mount hierarchy
+    mount_base = Path(args.mount_base)
+    case_id = getattr(args, "case_id", None) or ""
+    mount_id = generate_mount_id(case_id, image_path.stem)
+    image_mount_dir = mount_base / mount_id
+    container_dir = image_mount_dir / "container"
+    partitions_dir = image_mount_dir / "partitions"
+
+    ensure_mount_dir(container_dir)
+    ensure_mount_dir(partitions_dir)
+
+    # Mount the container
+    logger.info("Mounting container: %s", image_path.name)
+    result = handler.mount(image_path, container_dir)
+    if not result.success:
+        logger.error("Container mount failed: %s", result.error)
+        cleanup_mount_dir(image_mount_dir)
+        sys.exit(1)
+
+    # Track state for building the MountedImage
+    secondary_loop = ""
+    partition_infos = []
+    lvm_vg_names = []
+    partition_loops = []  # per-partition offset loop devices we created
+    zfs_pools = []  # ZFS pools we imported (exported on unmount)
+
+    # Detect and mount partitions
+    skip_partitions = (
+        getattr(args, "no_partitions", False) or
+        image_type in NO_PARTITION_TYPES
+    )
+
+    if not skip_partitions:
+        # Read the partition table from / back offset loops with a block device
+        # when the handler produced one (NBD / raw loop), else the FUSE-exposed
+        # raw image file (EWF / AFF).
+        backing = result.block_device or (
+            str(result.raw_image_path) if result.raw_image_path else ""
+        )
+        if backing:
+            partition_infos, partition_loops = expose_partitions(backing)
+
+            # LVM physical volumes may live on the exposed partition devices.
+            part_devices = [p.device for p in partition_infos if p.device]
+            lvm_vg_names = detect_lvm(part_devices)
+            if lvm_vg_names:
+                lv_paths = activate_lvm(lvm_vg_names)
+                for i, lv_path in enumerate(lv_paths):
+                    lv_part = PartitionInfo(device=lv_path, number=200 + i)
+                    _enrich_with_blkid(lv_part)
+                    partition_infos.append(lv_part)
+
+        # Mount each partition
+        for part in partition_infos:
+            part_mount = partitions_dir / _partition_dir_name(part)
+            mount_partition(part, part_mount)
+
+        # Import any ZFS pools living on the exposed devices (read-only). The
+        # zfs_member partitions above are intentionally skipped by
+        # mount_partition; the pool is brought online here instead.
+        zfs_pools, zfs_dataset_infos = _import_zfs_pools(partition_infos, image_mount_dir)
+        partition_infos.extend(zfs_dataset_infos)
+
+    elif image_type in NO_PARTITION_TYPES:
+        logger.info(
+            "Skipping partition detection (%s has no partition table)",
+            image_type.value.upper(),
+        )
+
+    # Save state
+    state_mgr = StateManager()
+    mounted = MountedImage(
+        mount_id=mount_id,
+        image_path=str(image_path),
+        image_type=image_type.value,
+        case_id=case_id,
+        mount_base=str(mount_base),
+        container_mount=str(container_dir),
+        block_device=result.block_device or "",
+        loop_device=result.loop_device or "",
+        secondary_loop=secondary_loop,
+        partition_loops=partition_loops,
+        raw_image_path=str(result.raw_image_path or ""),
+        partitions=[
+            MountedPartition(
+                device=p.device,
+                number=p.number,
+                filesystem=p.filesystem,
+                mount_point=str(p.mount_point or ""),
+                label=p.label,
+                size_bytes=p.size_bytes,
+                mounted=p.mounted,
+            )
+            for p in partition_infos
+        ],
+        lvm_vg_names=lvm_vg_names,
+        zfs_pools=zfs_pools,
+        mounted_at=datetime.now().isoformat(),
+        handler_class=handler.__class__.__name__,
+    )
+    state_mgr.add_mount(mounted)
+
+    # Print summary
+    _print_mount_summary(mount_id, image_path, image_type, result,
+                          partition_infos, image_mount_dir, args)
+
+    # Optional Maelstrom callback
+    if getattr(args, "maelstrom", False):
+        _invoke_maelstrom(partition_infos, image_mount_dir, args)
+
+    # JSON output for Whirlpool
+    if getattr(args, "json", False):
+        _print_json_output(mounted, partition_infos)
+
+
+def _import_zfs_pools(partition_infos, image_mount_dir: Path):
+    """Import ZFS pools found on the exposed devices, read-only.
+
+    Returns ``(pool_names, dataset_infos)``: the imported pool names (to export
+    on unmount) and PartitionInfo rows for each mounted dataset (for the
+    summary and state). Pools are imported under ``<image>/zfs/<pool>`` so the
+    evidence filesystem tree is reconstructed inside our managed mount dir.
+    """
+    vdevs = [p.device for p in partition_infos
+             if p.device and p.filesystem == "zfs_member"]
+    if not vdevs:
+        return [], []
+    if not zfs.zfs_available():
+        logger.warning(
+            "ZFS member device(s) present but zpool/zfs aren't installed - "
+            "skipping pool import. Install zfsutils-linux (mountir setup).")
+        return [], []
+
+    candidates = zfs.scan_pools(vdevs)
+    if not candidates:
+        logger.warning(
+            "ZFS member device(s) present but no importable pool was found "
+            "(the pool may span vdevs held in other images).")
+        return [], []
+
+    pool_names, dataset_infos = [], []
+    number = 300
+    for cand in candidates:
+        altroot = image_mount_dir / "zfs" / cand.name
+        ensure_mount_dir(altroot)
+        effective = zfs.import_pool(cand, altroot, vdevs)
+        if not effective:
+            continue
+        pool_names.append(effective)
+        for dataset, mountpoint in zfs.mount_datasets(effective):
+            dataset_infos.append(PartitionInfo(
+                device=dataset, number=number, filesystem="zfs",
+                label=dataset, mount_point=Path(mountpoint), mounted=True,
+            ))
+            number += 1
+    return pool_names, dataset_infos
+
+
+def _partition_dir_name(part) -> str:
+    """Build a readable mount-point dir name like 'p2_ntfs_Windows'.
+
+    Uses the filesystem label when present, otherwise the GPT partition name.
+    Both are sanitised to a filesystem-safe slug.
+    """
+    name = f"p{part.number}"
+    if part.filesystem:
+        name += f"_{part.filesystem}"
+    label = part.label or getattr(part, "pt_name", "")
+    if label:
+        safe = re.sub(r"[^A-Za-z0-9_.-]", "", label)[:32]
+        if safe:
+            name += f"_{safe}"
+    return name
+
+
+def _apply_json_input(args):
+    """Parse JSON input and apply to args."""
+    json_path = args.json_input
+    if json_path == "-":
+        data = json.load(sys.stdin)
+    else:
+        data = json.loads(Path(json_path).read_text(encoding="utf-8"))
+
+    # Apply JSON fields to args
+    if "image_path" in data:
+        args.image_path = data["image_path"]
+    if "case_id" in data:
+        args.case_id = data["case_id"]
+    if "mount_base" in data:
+        args.mount_base = data["mount_base"]
+
+    opts = data.get("mount_options", {})
+    if opts.get("no_partitions"):
+        args.no_partitions = True
+
+    callback = data.get("maelstrom_callback", {})
+    if callback.get("enabled"):
+        args.maelstrom = True
+        args.maelstrom_profiles = callback.get("profiles", [])
+        args.maelstrom_output = callback.get("output", "")
+
+
+def _print_mount_summary(mount_id, image_path, image_type, result,
+                          partitions, image_mount_dir, args):
+    """Print a human-readable mount summary."""
+    mounted_count = sum(1 for p in partitions if p.mounted)
+    failed_count = sum(1 for p in partitions if p.mount_error)
+
+    print(file=sys.stderr)
+    _h = lambda s: f"{Fore.GREEN}{Style.BRIGHT}{s}{Style.RESET_ALL}" if HAS_COLOR else s
+    _v = lambda s: f"{Fore.WHITE}{s}{Style.RESET_ALL}" if HAS_COLOR else s
+
+    print(_h("Mount Summary"), file=sys.stderr)
+    print(_h("=" * 50), file=sys.stderr)
+    print(f"  {'Image:':<18} {_v(image_path.name)}", file=sys.stderr)
+    print(f"  {'Type:':<18} {_v(image_type.value.upper())}", file=sys.stderr)
+    os_hint = infer_os(partitions)
+    if os_hint != "Unknown":
+        print(f"  {'Likely OS:':<18} {_v(os_hint)}", file=sys.stderr)
+    print(f"  {'Mount ID:':<18} {_v(mount_id)}", file=sys.stderr)
+    print(f"  {'Mount Dir:':<18} {_v(str(image_mount_dir))}", file=sys.stderr)
+
+    if result.block_device:
+        print(f"  {'Block Device:':<18} {_v(result.block_device)}", file=sys.stderr)
+    if result.raw_image_path:
+        print(f"  {'Raw Image:':<18} {_v(str(result.raw_image_path))}", file=sys.stderr)
+
+    if partitions:
+        print(f"\n  {'Partitions:':<18} {mounted_count} mounted", file=sys.stderr)
+        if failed_count:
+            _w = lambda s: f"{Fore.YELLOW}{s}{Style.RESET_ALL}" if HAS_COLOR else s
+            print(f"  {'Warnings:':<18} {_w(f'{failed_count} failed to mount')}",
+                  file=sys.stderr)
+
+        for p in partitions:
+            fs_info = p.filesystem or "unknown"
+            if p.label:
+                fs_info += f" ({p.label})"
+            if p.mounted:
+                _ok = lambda s: f"{Fore.GREEN}{s}{Style.RESET_ALL}" if HAS_COLOR else s
+                print(f"    {p.device:<20} {fs_info:<16} {_ok(str(p.mount_point))}",
+                      file=sys.stderr)
+            elif p.mount_error:
+                _err = lambda s: f"{Fore.RED}{s}{Style.RESET_ALL}" if HAS_COLOR else s
+                print(f"    {p.device:<20} {fs_info:<16} {_err('FAIL: ' + p.mount_error)}",
+                      file=sys.stderr)
+            else:
+                # Deliberately not mounted: pool member, swap, LVM PV, etc.
+                _skip = lambda s: f"{Fore.YELLOW}{s}{Style.RESET_ALL}" if HAS_COLOR else s
+                print(f"    {p.device:<20} {fs_info:<16} {_skip('skipped')}",
+                      file=sys.stderr)
+
+    print(file=sys.stderr)
+
+
+def _print_json_output(mounted, partitions):
+    """Print JSON output for machine consumption."""
+    output = {
+        "mount_id": mounted.mount_id,
+        "image_path": mounted.image_path,
+        "image_type": mounted.image_type,
+        "mount_base": mounted.mount_base,
+        "block_device": mounted.block_device,
+        "partitions": [
+            {
+                "device": p.device,
+                "number": p.number,
+                "filesystem": p.filesystem,
+                "label": p.label,
+                "mount_point": str(p.mount_point) if p.mount_point else None,
+                "mounted": p.mounted,
+            }
+            for p in partitions
+        ],
+    }
+    print(json.dumps(output, indent=2))
+
+
+def _invoke_maelstrom(partitions, image_mount_dir, args):
+    """Invoke Maelstrom on mounted partitions."""
+    maelstrom_path = SCRIPT_DIR.parent / "Maelstrom" / "maelstrom.py"
+    if not maelstrom_path.exists():
+        logger.warning("Maelstrom not found at %s", maelstrom_path)
+        return
+
+    mounted_paths = [str(p.mount_point) for p in partitions if p.mounted]
+    if not mounted_paths:
+        logger.warning("No mounted partitions for Maelstrom to process")
+        return
+
+    for mount_path in mounted_paths:
+        cmd = [sys.executable, str(maelstrom_path)]
+        profiles = getattr(args, "maelstrom_profiles", [])
+        if profiles:
+            cmd.extend(["--profiles"] + profiles)
+        output_dir = getattr(args, "maelstrom_output", "") or str(image_mount_dir / "collected")
+        cmd.extend(["-o", output_dir, mount_path])
+
+        logger.info("Invoking Maelstrom on %s", mount_path)
+        try:
+            run_command(cmd, check=False, timeout=600)
+        except Exception as e:
+            logger.error("Maelstrom failed on %s: %s", mount_path, e)
+
+
+# ---------------------------------------------------------------------------
+# Command: unmount
+# ---------------------------------------------------------------------------
+def cmd_unmount(args):
+    """Unmount previously mounted disk images."""
+    if not check_root():
+        logger.error("MountIR requires root privileges. Run with sudo.")
+        sys.exit(1)
+
+    state_mgr = StateManager()
+    state = state_mgr.load()
+
+    if not state.mounted_images:
+        logger.info("No mounted images found")
+        return
+
+    if getattr(args, "all", False):
+        targets = list(state.mounted_images)
+    else:
+        mount_ref = args.mount_point
+        target = (
+            state_mgr.find_by_mount_id(mount_ref) or
+            state_mgr.find_by_path(mount_ref)
+        )
+        if not target:
+            logger.error("No mounted image found for: %s", mount_ref)
+            logger.info("Use 'mountir list' to see mounted images")
+            sys.exit(1)
+        targets = [target]
+
+    success_count = 0
+    for mounted in targets:
+        if _unmount_single(mounted, state_mgr):
+            success_count += 1
+
+    logger.info("Unmounted %d of %d image(s)", success_count, len(targets))
+
+
+def _umount_path(path: str) -> bool:
+    """Unmount a path, falling back to a lazy unmount if it is busy.
+
+    A busy mount (e.g. a shell with its cwd inside it) makes a normal umount
+    fail; the lazy `umount -l` fallback detaches it so cleanup can proceed.
+    """
+    for cmd in (["umount", path], ["umount", "-l", path]):
+        try:
+            run_command(cmd, capture=False)  # check=True: raises on failure
+            if "-l" in cmd:
+                logger.warning("Lazy-unmounted busy path: %s", path)
+            else:
+                logger.debug("Unmounted: %s", path)
+            return True
+        except subprocess.CalledProcessError:
+            continue
+        except FileNotFoundError:
+            logger.error("umount command not found")
+            return False
+    logger.error("Failed to unmount %s (in use? 'cd' out of it and retry)", path)
+    return False
+
+
+def _unmount_single(mounted: MountedImage, state_mgr: StateManager) -> bool:
+    """Unmount a single image in reverse order.
+
+    Order: partitions -> LVM -> secondary loop -> container. Returns True only
+    when every layer was released (a lazy fallback still counts as released).
+    """
+    logger.info("Unmounting: %s (%s)", mounted.mount_id, mounted.image_path)
+    all_ok = True
+
+    # 0. Export ZFS pools first: this unmounts all their datasets and releases
+    #    the vdev (offset-loop) devices, so it must happen before we detach the
+    #    loops those pools sit on.
+    for pool in getattr(mounted, "zfs_pools", []) or []:
+        if not zfs.export_pool(pool):
+            all_ok = False
+
+    # 1. Unmount partitions (reverse order). ZFS datasets were already unmounted
+    #    by the pool export above, so skip them here.
+    for part in reversed(mounted.partitions):
+        if part.filesystem == "zfs":
+            continue
+        if part.mounted and part.mount_point:
+            if not _umount_path(part.mount_point):
+                all_ok = False
+
+    # 2. Deactivate LVM
+    if mounted.lvm_vg_names:
+        deactivate_lvm(mounted.lvm_vg_names)
+
+    # 3. Detach per-partition offset loop devices (reverse order). These are
+    #    backed by the raw image / whole-disk loop, so release them before the
+    #    container/secondary loop they sit on.
+    for loop in reversed(getattr(mounted, "partition_loops", []) or []):
+        try:
+            run_command(["losetup", "-d", loop], check=False, capture=False)
+            logger.debug("Detached partition loop: %s", loop)
+        except Exception:
+            pass
+
+    # 4. Detach secondary loop device (for FUSE raw images)
+    if mounted.secondary_loop:
+        try:
+            run_command(["losetup", "-d", mounted.secondary_loop], check=False, capture=False)
+            logger.debug("Detached secondary loop: %s", mounted.secondary_loop)
+        except Exception:
+            pass
+
+    # 5. Unmount container
+    try:
+        handler = get_handler(ImageType(mounted.image_type))
+        container_result = MountResult(
+            success=True,
+            mount_point=Path(mounted.container_mount) if mounted.container_mount else None,
+            block_device=mounted.block_device or None,
+            loop_device=mounted.loop_device or None,
+        )
+        if handler.unmount(container_result) is False:
+            all_ok = False
+    except Exception as e:
+        logger.error("Failed to unmount container: %s", e)
+        all_ok = False
+
+    # 6. Cleanup directories (rmdir only removes empty dirs, so a still-busy
+    #    mount is left in place rather than disturbed).
+    if mounted.mount_base and mounted.mount_id:
+        cleanup_mount_dir(Path(mounted.mount_base) / mounted.mount_id)
+
+    # 7. Remove from state
+    state_mgr.remove_mount(mounted.mount_id)
+    if all_ok:
+        logger.info("Successfully unmounted: %s", mounted.mount_id)
+    else:
+        logger.warning(
+            "Unmounted %s with errors - a mount was busy. Make sure no shell "
+            "or process is inside the mount, then retry.", mounted.mount_id,
+        )
+    return all_ok
+
+
+# ---------------------------------------------------------------------------
+# Command: list
+# ---------------------------------------------------------------------------
+def cmd_list(args):
+    """List currently mounted disk images."""
+    state_mgr = StateManager()
+    state = state_mgr.load()
+
+    if not state.mounted_images:
+        logger.info("No mounted images")
+        return
+
+    # Check for stale mounts
+    stale = state_mgr.verify_mounts()
+    stale_ids = {img.mount_id for img in stale}
+
+    if getattr(args, "json", False):
+        from dataclasses import asdict
+        output = {
+            "mounted_images": [asdict(img) for img in state.mounted_images],
+            "stale_mount_ids": list(stale_ids),
+        }
+        print(json.dumps(output, indent=2))
+        return
+
+    _h = lambda s: f"{Fore.CYAN}{Style.BRIGHT}{s}{Style.RESET_ALL}" if HAS_COLOR else s
+
+    print(file=sys.stderr)
+    print(_h(f"Mounted Images ({len(state.mounted_images)})"), file=sys.stderr)
+    print(_h("=" * 70), file=sys.stderr)
+
+    for img in state.mounted_images:
+        status = ""
+        if img.mount_id in stale_ids:
+            status = f" {Fore.YELLOW}[STALE]{Style.RESET_ALL}" if HAS_COLOR else " [STALE]"
+
+        print(f"\n  Mount ID:    {img.mount_id}{status}", file=sys.stderr)
+        print(f"  Image:       {img.image_path}", file=sys.stderr)
+        print(f"  Type:        {img.image_type.upper()}", file=sys.stderr)
+        if img.case_id:
+            print(f"  Case ID:     {img.case_id}", file=sys.stderr)
+        print(f"  Mounted At:  {img.mounted_at}", file=sys.stderr)
+        print(f"  Mount Dir:   {Path(img.mount_base) / img.mount_id}", file=sys.stderr)
+
+        if img.block_device:
+            print(f"  Block Dev:   {img.block_device}", file=sys.stderr)
+
+        mounted_parts = [p for p in img.partitions if p.mounted]
+        if mounted_parts:
+            print(f"  Partitions:  {len(mounted_parts)} mounted", file=sys.stderr)
+            for p in mounted_parts:
+                fs = p.filesystem or "unknown"
+                lbl = f" ({p.label})" if p.label else ""
+                print(f"    {p.device:<20} {fs}{lbl:<16} -> {p.mount_point}",
+                      file=sys.stderr)
+
+    print(file=sys.stderr)
+
+    if stale:
+        logger.warning(
+            "%d stale mount(s) detected (may have been lost after reboot). "
+            "Use 'unmount --all' to clean state.",
+            len(stale),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Command: check
+# ---------------------------------------------------------------------------
+def cmd_check(args):
+    """Check tool dependency availability."""
+    from utils import tool_exists
+
+    # Format handlers: (label, [tools incl. fallbacks], apt package hint)
+    handlers_to_check = [
+        ("E01/L01/Ex01", ["ewfmount"], "ewf-tools"),
+        ("DD/Raw/IMG", ["losetup"], "util-linux (built-in)"),
+        ("VMDK", ["qemu-nbd", "vmdkmount"], "qemu-utils / libvmdk-utils"),
+        ("VHD/VHDX", ["qemu-nbd", "vhdimount"], "qemu-utils / libvhdi-utils"),
+        ("QCOW2", ["qemu-nbd"], "qemu-utils"),
+        ("ISO", ["mount"], "util-linux (built-in)"),
+        ("AFF", ["affuse"], "afflib-tools"),
+    ]
+
+    # Supporting tools
+    support_tools = [
+        ("fdisk", "util-linux (built-in)", "Partition detection"),
+        ("blkid", "util-linux (built-in)", "Filesystem identification"),
+        ("kpartx", "kpartx", "Partition mapping"),
+        ("pvs", "lvm2", "LVM detection"),
+        ("fusermount", "fuse", "FUSE unmounting"),
+        ("file", "file (built-in)", "Image type detection"),
+    ]
+
+    # Filesystem drivers: (label, probe-tool-or-None, install hint, description).
+    # A None tool means the in-kernel driver is used (nothing to install).
+    fs_drivers = [
+        ("NTFS", "ntfs-3g", "ntfs-3g", "Windows volumes"),
+        ("exFAT", "mount.exfat-fuse", "exfat-fuse", "exFAT (kernel 5.4+ also works)"),
+        ("HFS+", "fsck.hfsplus", "hfsprogs", "macOS legacy volumes"),
+        ("APFS", "apfs-fuse", "built from source: mountir setup", "macOS APFS volumes"),
+        ("VMFS", "vmfs-fuse", "vmfs-tools", "VMware ESXi datastores"),
+        ("ZFS", "zpool", "zfsutils-linux", "ZFS pools (also needs kernel module)"),
+        ("UFS", None, "kernel driver", "FreeBSD/NetScaler/pfSense"),
+    ]
+
+    if getattr(args, "json", False):
+        output = {"format_handlers": {}, "support_tools": {},
+                  "filesystem_drivers": {}}
+        for fmt, tools, pkg in handlers_to_check:
+            output["format_handlers"][fmt] = {
+                t: tool_exists(t) for t in tools
+            }
+        for tool, pkg, desc in support_tools:
+            output["support_tools"][tool] = tool_exists(tool)
+        for label, tool, hint, desc in fs_drivers:
+            output["filesystem_drivers"][label] = (
+                True if tool is None else tool_exists(tool)
+            )
+        output["ewfmount_version"] = bootstrap.installed_ewfmount_version()
+        output["ewfmount_modern"] = bootstrap.have_modern_libewf()
+        print(json.dumps(output, indent=2))
+        return
+
+    _h = lambda s: f"{Fore.CYAN}{Style.BRIGHT}{s}{Style.RESET_ALL}" if HAS_COLOR else s
+    _ok = lambda s: f"{Fore.GREEN}{s}{Style.RESET_ALL}" if HAS_COLOR else s
+    _miss = lambda s: f"{Fore.RED}{s}{Style.RESET_ALL}" if HAS_COLOR else s
+
+    print(file=sys.stderr)
+    print(_h("MountIR Dependency Check"), file=sys.stderr)
+    print(_h("=" * 55), file=sys.stderr)
+
+    print(f"\n{_h('Format Handlers:')}", file=sys.stderr)
+    for fmt, tools, pkg in handlers_to_check:
+        statuses = []
+        for tool in tools:
+            exists = tool_exists(tool)
+            status = _ok("OK") if exists else _miss("MISSING")
+            statuses.append(f"{tool}: {status}")
+        print(f"  {fmt:<14} {' | '.join(statuses)}", file=sys.stderr)
+        if any(not tool_exists(t) for t in tools):
+            print(f"  {'':14} Install: sudo apt install {pkg}", file=sys.stderr)
+
+    # ewfmount: apt ships the 2014 legacy line (no EWF2); flag whether the
+    # installed build can read EnCase v7 Ex01/Lx01 images.
+    ewf_ver = bootstrap.installed_ewfmount_version()
+    if ewf_ver:
+        if bootstrap.have_modern_libewf():
+            note = _ok(f"v{ewf_ver}: modern, Ex01/Lx01 supported")
+        else:
+            note = _miss(f"v{ewf_ver}: legacy, no Ex01/Lx01")
+        print(f"  {'':14} {note}", file=sys.stderr)
+        if not bootstrap.have_modern_libewf():
+            print(f"  {'':14} Build modern libewf: mountir setup",
+                  file=sys.stderr)
+
+    print(f"\n{_h('Support Tools:')}", file=sys.stderr)
+    for tool, pkg, desc in support_tools:
+        exists = tool_exists(tool)
+        status = _ok("OK") if exists else _miss("MISSING")
+        print(f"  {tool:<14} {status:<10} {desc}", file=sys.stderr)
+        if not exists:
+            print(f"  {'':14} Install: sudo apt install {pkg}", file=sys.stderr)
+
+    print(f"\n{_h('Filesystem Drivers:')}", file=sys.stderr)
+    for label, tool, hint, desc in fs_drivers:
+        if tool is None:
+            print(f"  {label:<14} {_ok('builtin'):<10} {desc}", file=sys.stderr)
+            continue
+        exists = tool_exists(tool)
+        status = _ok("OK") if exists else _miss("MISSING")
+        print(f"  {label:<14} {status:<10} {desc} ({tool})", file=sys.stderr)
+        if not exists:
+            if hint.startswith("built from source"):
+                print(f"  {'':14} {hint}", file=sys.stderr)
+            else:
+                print(f"  {'':14} Install: sudo apt install {hint}", file=sys.stderr)
+
+    print(f"\n  Run 'mountir setup' to install everything automatically.\n",
+          file=sys.stderr)
+
+
+# Mount bases we refuse to "clean" without --force, so a mistyped --mount-base
+# can never mass-unmount a system path.
+_PROTECTED_BASES = {
+    "/", "/mnt", "/home", "/dev", "/proc", "/sys", "/run", "/boot",
+    "/usr", "/var", "/etc", "/tmp", "/root", "/srv", "/opt",
+}
+
+
+def cmd_clean(args):
+    """Scavenge the mount base for orphaned mounts and remove them.
+
+    Unmounts anything still mounted under --mount-base (deepest first, with a
+    lazy fallback), detaches loop devices backing files there, removes the
+    leftover mount-point directories, and prunes stale state entries.
+    """
+    if not check_root():
+        logger.error("MountIR requires root privileges. Run with sudo.")
+        sys.exit(1)
+
+    base = Path(args.mount_base).resolve()
+    force = getattr(args, "force", False)
+
+    # Safety guard: never mass-unmount a system path by accident.
+    if str(base) in _PROTECTED_BASES or len(base.parts) < 3:
+        logger.error(
+            "Refusing to clean '%s' - it looks like a system path. Point "
+            "--mount-base at a dedicated directory such as /mnt/mountir%s.",
+            base, "" if force else " (or pass --force)",
+        )
+        if not force:
+            sys.exit(1)
+
+    if not base.exists():
+        logger.info("Nothing to clean: %s does not exist", base)
+        return
+
+    state_mgr = StateManager()
+
+    # Gather loop devices to detach -- captured BEFORE unmounting. Unmounting a
+    # FUSE container mangles its backing-file path (".../ewf1" -> "/ewf1"), which
+    # hides the loop from a path-based lookup and orphans it. We collect from two
+    # sources: the live losetup table matched by backing path (valid only while
+    # the container is still mounted) and recorded state (exact device names,
+    # immune to the mangling).
+    loops_to_detach = set(loop_devices_backing(base))
+    pools_to_export = set()
+    base_str = str(base)
+    for img in state_mgr.load().mounted_images:
+        mb = str(img.mount_base or "")
+        if mb == base_str or mb.startswith(f"{base_str}/"):
+            loops_to_detach.update(img.partition_loops or [])
+            if img.secondary_loop:
+                loops_to_detach.add(img.secondary_loop)
+            pools_to_export.update(getattr(img, "zfs_pools", []) or [])
+
+    # 0. Export ZFS pools first: a plain umount of a dataset leaves the pool
+    #    imported and its vdev loops held, so detaching them would fail.
+    for pool in sorted(pools_to_export):
+        zfs.export_pool(pool)
+
+    # 1. Unmount everything under the base, deepest first.
+    mounts = find_mounts_under(base)
+    if mounts:
+        logger.info("Unmounting %d mount(s) under %s", len(mounts), base)
+    for mp in mounts:
+        _umount_path(mp)
+
+    # 2. Detach the loop devices gathered above (now released by the unmounts).
+    for dev in sorted(loops_to_detach):
+        try:
+            run_command(["losetup", "-d", dev], check=False, capture=False)
+            logger.info("Detached loop device: %s", dev)
+        except Exception:
+            pass
+
+    # 3. Remove leftover (now-empty) mount-point directories.
+    for child in sorted(base.iterdir()):
+        if child.is_dir():
+            cleanup_mount_dir(child)
+
+    # 4. Prune state entries that are no longer actually mounted.
+    for stale in state_mgr.verify_mounts():
+        state_mgr.remove_mount(stale.mount_id)
+        logger.info("Pruned stale state entry: %s", stale.mount_id)
+
+    remaining = find_mounts_under(base)
+    if remaining:
+        logger.warning(
+            "%d mount(s) under %s are still busy and were left in place. "
+            "Make sure nothing is using them, then re-run.",
+            len(remaining), base,
+        )
+    else:
+        logger.info("Cleanup complete - %s is clear", base)
+
+
+def cmd_setup(args):
+    """Install all MountIR dependencies (Python + system forensic tools).
+
+    ``--force`` rebuilds the source-built tools (apfs-fuse, libewf) even when
+    already present; without it an existing modern libewf/apfs-fuse is reused.
+    """
+    bootstrap.run_bootstrap(force=getattr(args, "force", False))
+
+
+def cmd_install_deps(args):
+    """Backwards-compatible alias for 'setup' (installs system tools)."""
+    bootstrap.run_bootstrap(force=getattr(args, "force", False))
+
+
+# ---------------------------------------------------------------------------
+# CLI argument parser
+# ---------------------------------------------------------------------------
+def build_parser() -> argparse.ArgumentParser:
+    """Build the argument parser with all subcommands."""
+    parser = argparse.ArgumentParser(
+        prog="mountir",
+        description="MountIR - Forensic Disk Image Mounting Utility",
+    )
+    parser.add_argument(
+        "--version", action="version",
+        version=f"MountIR v{MOUNTIR_VERSION}",
+    )
+    parser.add_argument(
+        "--no-setup", action="store_true",
+        help="Skip the first-run dependency bootstrap",
+    )
+
+    subparsers = parser.add_subparsers(dest="command", help="Available commands")
+
+    # --- mount ---
+    mount_parser = subparsers.add_parser("mount", help="Mount a forensic disk image")
+    mount_parser.add_argument(
+        "image_path", nargs="?",
+        help="Path to the disk image file",
+    )
+    mount_parser.add_argument(
+        "--mount-base", default="/mnt/mountir",
+        help="Base directory for mount points (default: /mnt/mountir)",
+    )
+    mount_parser.add_argument(
+        "--case-id", default="",
+        help="Case identifier (used in mount point naming)",
+    )
+    mount_parser.add_argument(
+        "--no-partitions", action="store_true",
+        help="Mount container only, skip partition detection",
+    )
+    mount_parser.add_argument(
+        "--json-input", metavar="FILE",
+        help="Read mount request from JSON file (use '-' for stdin)",
+    )
+    mount_parser.add_argument(
+        "--maelstrom", action="store_true",
+        help="Invoke Maelstrom on mounted filesystems after mount",
+    )
+    mount_parser.add_argument(
+        "--maelstrom-profiles", nargs="*", default=[],
+        help="Profiles to pass to Maelstrom",
+    )
+    mount_parser.add_argument("-v", "--verbose", action="store_true")
+    mount_parser.add_argument("--json", action="store_true",
+                               help="Output results as JSON")
+
+    # --- unmount ---
+    unmount_parser = subparsers.add_parser("unmount", help="Unmount a mounted image")
+    unmount_parser.add_argument(
+        "mount_point", nargs="?",
+        help="Mount ID or path to unmount",
+    )
+    unmount_parser.add_argument(
+        "--all", action="store_true",
+        help="Unmount all mounted images",
+    )
+    unmount_parser.add_argument("-v", "--verbose", action="store_true")
+    unmount_parser.add_argument("--json", action="store_true",
+                                 help="Output results as JSON")
+
+    # --- list ---
+    list_parser = subparsers.add_parser("list", help="List mounted images")
+    list_parser.add_argument("-v", "--verbose", action="store_true")
+    list_parser.add_argument("--json", action="store_true",
+                              help="Output results as JSON")
+
+    # --- check ---
+    check_parser = subparsers.add_parser("check", help="Check tool dependencies")
+    check_parser.add_argument("-v", "--verbose", action="store_true")
+    check_parser.add_argument("--json", action="store_true",
+                               help="Output results as JSON")
+
+    # --- clean ---
+    clean_parser = subparsers.add_parser(
+        "clean", help="Unmount and remove orphaned mounts under the mount base",
+    )
+    clean_parser.add_argument(
+        "--mount-base", default="/mnt/mountir",
+        help="Mount base to clean (default: /mnt/mountir)",
+    )
+    clean_parser.add_argument(
+        "--force", action="store_true",
+        help="Override the system-path safety guard",
+    )
+    clean_parser.add_argument("-v", "--verbose", action="store_true")
+
+    # --- setup ---
+    setup_parser = subparsers.add_parser(
+        "setup", help="Install all MountIR dependencies (Python + system tools)",
+    )
+    setup_parser.add_argument("-v", "--verbose", action="store_true")
+    setup_parser.add_argument(
+        "--force", action="store_true",
+        help="Rebuild source-built tools (apfs-fuse, libewf) even if already "
+             "present; set MOUNTIR_LIBEWF_VERSION to pull a newer libewf",
+    )
+
+    # --- install-deps (legacy alias for setup) ---
+    install_parser = subparsers.add_parser(
+        "install-deps", help="Alias for 'setup' (install system forensic tools)",
+    )
+    install_parser.add_argument("-v", "--verbose", action="store_true")
+
+    return parser
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+COMMAND_MAP = {
+    "mount": cmd_mount,
+    "unmount": cmd_unmount,
+    "list": cmd_list,
+    "check": cmd_check,
+    "clean": cmd_clean,
+    "setup": cmd_setup,
+    "install-deps": cmd_install_deps,
+}
+
+
+def main():
+    parser = build_parser()
+    args = parser.parse_args()
+
+    if not args.command:
+        print_banner()
+        parser.print_help(sys.stderr)
+        sys.exit(0)
+
+    # Whether to run the first-run dependency bootstrap for this command.
+    # 'setup'/'install-deps' do their own install; --no-setup / the
+    # MOUNTIR_NO_BOOTSTRAP env var opt out entirely.
+    skip_bootstrap = (
+        args.command in ("setup", "install-deps")
+        or getattr(args, "no_setup", False)
+    )
+
+    # Re-launch inside the project virtualenv BEFORE any real work, so Python
+    # dependencies load from the venv rather than the system/root interpreter.
+    # No-op once inside the venv (or when opted out); may replace the process.
+    if not skip_bootstrap:
+        bootstrap.ensure_venv_runtime()
+
+    # Setup logging
+    verbose = getattr(args, "verbose", False)
+    log_file = setup_logging(verbose)
+
+    print_banner()
+    logger.debug("MountIR v%s started", MOUNTIR_VERSION)
+    logger.debug("Log file: %s", log_file)
+
+    # Now inside the venv: install any missing system forensic tools (once,
+    # tracked by a marker file).
+    if not skip_bootstrap:
+        bootstrap.ensure_system_bootstrap()
+
+    # Validate mount subcommand has image_path
+    if args.command == "mount" and not args.image_path and not args.json_input:
+        logger.error("mount requires an image path or --json-input")
+        sys.exit(1)
+
+    # Validate unmount subcommand
+    if args.command == "unmount" and not args.mount_point and not getattr(args, "all", False):
+        logger.error("unmount requires a mount point/ID or --all")
+        sys.exit(1)
+
+    # Dispatch
+    handler_fn = COMMAND_MAP.get(args.command)
+    if handler_fn:
+        try:
+            handler_fn(args)
+        except KeyboardInterrupt:
+            logger.info("Interrupted by user")
+            sys.exit(130)
+        except Exception as e:
+            logger.error("Unexpected error: %s", e)
+            logger.debug("Traceback:", exc_info=True)
+            sys.exit(1)
+    else:
+        parser.print_help(sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

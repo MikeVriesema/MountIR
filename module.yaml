@@ -1,0 +1,9 @@
+name: "MountIR"
+description: "Forensic disk image mounting with 15+ format support"
+stage: "Collection"
+entry: "mountir.py"
+web_ui: false
+accepts_hurricane_output: false
+standalone: true
+pipeline: true
+docker_ready: false

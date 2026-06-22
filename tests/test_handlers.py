@@ -1,0 +1,177 @@
+"""Tests for handler registry and base handler logic."""
+
+from unittest.mock import patch
+
+import pytest
+
+from detector import ImageType
+from handlers import (
+    get_handler, HANDLER_REGISTRY, ALL_HANDLER_CLASSES, NO_PARTITION_TYPES,
+)
+from handlers.base import BaseHandler, MountResult
+from handlers.raw import RawHandler
+from handlers.ewf import EwfHandler
+from handlers.vmdk import VmdkHandler
+from handlers.vhd import VhdHandler
+from handlers.qcow import QcowHandler
+from handlers.iso import IsoHandler
+from handlers.aff import AffHandler
+
+
+class TestHandlerRegistry:
+    """Test the handler registry and factory."""
+
+    @pytest.mark.parametrize("image_type,handler_class", [
+        (ImageType.E01, EwfHandler),
+        (ImageType.L01, EwfHandler),
+        (ImageType.VMDK, VmdkHandler),
+        (ImageType.VHD, VhdHandler),
+        (ImageType.VHDX, VhdHandler),
+        (ImageType.RAW, RawHandler),
+        (ImageType.ISO, IsoHandler),
+        (ImageType.AFF, AffHandler),
+        (ImageType.QCOW2, QcowHandler),
+    ])
+    def test_get_handler_returns_correct_type(self, image_type, handler_class):
+        """get_handler returns correct handler class for each ImageType."""
+        handler = get_handler(image_type)
+        assert isinstance(handler, handler_class)
+
+    def test_get_handler_unknown_raises(self):
+        """get_handler raises ValueError for UNKNOWN type."""
+        with pytest.raises(ValueError, match="No handler"):
+            get_handler(ImageType.UNKNOWN)
+
+    def test_registry_covers_all_types(self):
+        """Registry has entries for all ImageType values except UNKNOWN."""
+        for image_type in ImageType:
+            if image_type == ImageType.UNKNOWN:
+                continue
+            assert image_type in HANDLER_REGISTRY, f"Missing handler for {image_type}"
+
+    def test_all_handler_classes_list(self):
+        """ALL_HANDLER_CLASSES contains all handler types."""
+        assert EwfHandler in ALL_HANDLER_CLASSES
+        assert RawHandler in ALL_HANDLER_CLASSES
+        assert VmdkHandler in ALL_HANDLER_CLASSES
+        assert VhdHandler in ALL_HANDLER_CLASSES
+        assert IsoHandler in ALL_HANDLER_CLASSES
+        assert AffHandler in ALL_HANDLER_CLASSES
+        assert QcowHandler in ALL_HANDLER_CLASSES
+
+
+class TestNoPartitionTypes:
+    """Test NO_PARTITION_TYPES set."""
+
+    def test_iso_in_no_partition(self):
+        assert ImageType.ISO in NO_PARTITION_TYPES
+
+    def test_l01_in_no_partition(self):
+        assert ImageType.L01 in NO_PARTITION_TYPES
+
+    def test_e01_not_in_no_partition(self):
+        """E01 (disk image) should have partitions."""
+        assert ImageType.E01 not in NO_PARTITION_TYPES
+
+    def test_raw_not_in_no_partition(self):
+        assert ImageType.RAW not in NO_PARTITION_TYPES
+
+
+class TestVhdHandlerVariants:
+    """Test VHD vs VHDX handler differences."""
+
+    def test_vhd_has_fallback(self):
+        handler = VhdHandler(is_vhdx=False)
+        assert "vhdimount" in handler.fallback_tools
+
+    def test_vhdx_no_fallback(self):
+        handler = VhdHandler(is_vhdx=True)
+        assert handler.fallback_tools == []
+
+    def test_vhd_format_name(self):
+        assert VhdHandler(is_vhdx=False).format_name == "VHD"
+
+    def test_vhdx_format_name(self):
+        assert VhdHandler(is_vhdx=True).format_name == "VHDX"
+
+
+class TestCheckTools:
+    """Test BaseHandler.check_tools() logic."""
+
+    def test_all_tools_present(self):
+        """check_tools with all primary tools available."""
+        handler = RawHandler()
+        with patch("handlers.base.tool_exists", return_value=True):
+            result = handler.check_tools()
+        assert result["usable"] is True
+        assert result["fallback_in_use"] is False
+        assert "losetup" in result["available"]
+        assert result["missing"] == []
+
+    def test_all_tools_missing(self):
+        """check_tools with all tools missing."""
+        handler = EwfHandler()
+        with patch("handlers.base.tool_exists", return_value=False):
+            result = handler.check_tools()
+        assert result["usable"] is False
+        assert "ewfmount" in result["missing"]
+
+    def test_fallback_used(self):
+        """check_tools with primary missing but fallback present."""
+        handler = VmdkHandler()
+        def mock_tool(name):
+            return name == "vmdkmount"  # primary qemu-nbd missing, fallback available
+        with patch("handlers.base.tool_exists", side_effect=mock_tool):
+            result = handler.check_tools()
+        assert result["usable"] is True
+        assert result["fallback_in_use"] is True
+
+
+class TestMountResult:
+    """Test MountResult dataclass."""
+
+    def test_success_result(self):
+        r = MountResult(success=True, block_device="/dev/nbd0")
+        assert r.success is True
+        assert r.block_device == "/dev/nbd0"
+        assert r.error is None
+
+    def test_failure_result(self):
+        r = MountResult(success=False, error="tool not found")
+        assert r.success is False
+        assert r.error == "tool not found"
+        assert r.block_device is None
+
+    def test_defaults(self):
+        r = MountResult(success=True)
+        assert r.mount_point is None
+        assert r.block_device is None
+        assert r.loop_device is None
+        assert r.raw_image_path is None
+        assert r.error is None
+
+
+class TestHandlerProperties:
+    """Test handler property values."""
+
+    @pytest.mark.parametrize("handler,name", [
+        (RawHandler(), "DD/Raw"),
+        (EwfHandler(), "E01/EWF (incl. Ex01)"),
+        (VmdkHandler(), "VMDK"),
+        (QcowHandler(), "QCOW2"),
+        (IsoHandler(), "ISO"),
+        (AffHandler(), "AFF"),
+    ])
+    def test_format_name(self, handler, name):
+        assert handler.format_name == name
+
+    @pytest.mark.parametrize("handler,tools", [
+        (RawHandler(), ["losetup"]),
+        (EwfHandler(), ["ewfmount"]),
+        (VmdkHandler(), ["qemu-nbd"]),
+        (QcowHandler(), ["qemu-nbd"]),
+        (IsoHandler(), ["mount"]),
+        (AffHandler(), ["affuse"]),
+    ])
+    def test_required_tools(self, handler, tools):
+        assert handler.required_tools == tools

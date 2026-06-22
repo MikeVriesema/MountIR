@@ -1,0 +1,10 @@
+# MountIR runtime Python dependencies (pinned).
+#
+# MountIR's heavy lifting is done by external system tools (ewfmount,
+# qemu-nbd, affuse, ...) which are installed separately via `mountir setup`
+# (apt). The only Python runtime dependency is colorama for coloured output.
+#
+# Install with:  python -m pip install -r requirements.txt
+#                (or run `mountir setup`, which does this automatically)
+
+colorama==0.4.6   # cross-platform coloured terminal output

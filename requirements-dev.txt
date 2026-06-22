@@ -1,0 +1,7 @@
+# MountIR development/test dependencies (pinned).
+#
+# Install with:  python -m pip install -r requirements-dev.txt
+
+-r requirements.txt
+
+pytest==9.0.3   # test runner for the suite under tests/

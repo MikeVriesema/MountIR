@@ -1,0 +1,672 @@
+#!/usr/bin/env python3
+"""MountIR dependency bootstrapping.
+
+Single source of truth for MountIR's runtime dependencies and the logic that
+pulls them in.  Two layers of dependencies are managed:
+
+* **Python packages** - declared in ``requirements.txt`` (pinned) and installed
+  into a project-local **virtual environment** (``.venv/``).  They are never
+  installed into the system interpreter, so running MountIR as root does not
+  pollute the OS Python and side-steps PEP 668 ("externally-managed-
+  environment") errors on modern Debian/Ubuntu.
+* **System forensic tools** - the external binaries each format handler shells
+  out to (``ewfmount``, ``qemu-nbd``, ``affuse`` ...), installed with ``apt`` on
+  Debian/Ubuntu-based systems.
+
+On the very first run MountIR:
+
+1. creates ``.venv`` and installs the pinned Python deps into it,
+2. **re-launches itself inside that venv** (so ``colorama`` & friends import
+   from the venv, not the root site-packages),
+3. installs any missing system forensic tools, and
+4. drops a marker file so the system-tool step is not repeated.
+
+``mountir setup`` re-runs the whole thing on demand.  Set
+``MOUNTIR_NO_BOOTSTRAP=1`` (or pass ``--no-setup``) to opt out entirely and run
+against the current interpreter.
+"""
+
+import logging
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+from typing import Dict, List, Optional
+
+from utils import logger, tool_exists, SCRIPT_DIR
+
+# ---------------------------------------------------------------------------
+# Dependency declarations
+# ---------------------------------------------------------------------------
+REQUIREMENTS_FILE = SCRIPT_DIR / "requirements.txt"
+
+# Project-local virtual environment that holds MountIR's Python dependencies.
+VENV_DIR = SCRIPT_DIR / ".venv"
+
+# Map an external tool -> the apt package that provides it.
+# Tools shipped by util-linux/coreutils are present on virtually every Linux
+# install and are listed for documentation/completeness.
+SYSTEM_PACKAGES: Dict[str, str] = {
+    # Format handlers
+    "ewfmount": "ewf-tools",        # E01/L01 baseline; apt is the 2014 legacy
+                                    # line -> build_libewf adds EWF2 (Ex01/Lx01)
+    "qemu-nbd": "qemu-utils",       # VMDK, VHD/VHDX, QCOW2, VDI (primary)
+    "affuse": "afflib-tools",       # AFF
+    "vmdkmount": "libvmdk-utils",   # VMDK (fallback)
+    "vhdimount": "libvhdi-utils",   # VHD/VHDX (fallback)
+    # Partition / filesystem support
+    "kpartx": "kpartx",             # partition device mapping
+    "pvs": "lvm2",                  # LVM detection/activation
+    "fusermount": "fuse",           # FUSE unmounting
+    "ntfs-3g": "ntfs-3g",           # NTFS mounting
+    "mmls": "sleuthkit",            # partition layout (fallback to fdisk)
+    # Extended filesystem drivers (broad forensic FS coverage)
+    "mount.exfat-fuse": "exfat-fuse",  # exFAT FUSE fallback (kernel handles 5.4+)
+    "fsck.exfat": "exfatprogs",        # exFAT userland (label/fsck)
+    "fsck.hfsplus": "hfsprogs",        # macOS HFS+ fsck/label helpers
+    "vmfs-fuse": "vmfs-tools",         # VMware ESXi VMFS5 datastores
+    "zpool": "zfsutils-linux",         # ZFS pool import (also needs kernel module)
+    # UFS (FreeBSD/NetScaler/pfSense) uses the in-kernel ufs driver - no package.
+    # APFS (apfs-fuse) is not in apt; it is built from source (see build_apfs_fuse).
+    # Built-ins (util-linux / file) - listed for completeness
+    "fdisk": "fdisk",
+    "blkid": "util-linux",
+    "losetup": "util-linux",
+    "file": "file",
+}
+
+# apfs-fuse is the only maintained read-only APFS driver for Linux and is not
+# packaged for apt, so it is built from source on demand.
+APFS_FUSE_REPO = "https://github.com/sgan81/apfs-fuse.git"
+APFS_FUSE_BUILD_DEPS = [
+    "git", "cmake", "g++", "libfuse3-dev", "libbz2-dev",
+    "zlib1g-dev", "libattr1-dev",
+]
+_SOURCE_BUILD_ROOT = Path("/var/lib/mountir/src")
+
+# The apt ``ewf-tools`` package ships the frozen 2014 *legacy* libewf line
+# (version 20140807), which cannot read EWF2 (Ex01/Lx01) EnCase v7 containers.
+# MountIR builds the maintained libyal release from source so a newer
+# ``ewfmount`` in /usr/local/bin shadows the apt one and adds Ex01/Lx01 support.
+#
+# Pinned for forensic reproducibility (you want to know exactly which tool
+# version touched the evidence).  Override with the ``MOUNTIR_LIBEWF_VERSION``
+# env var and rebuild with ``mountir setup --force`` -- a newer upstream release
+# may change behaviour, so bumping is deliberate, not automatic.
+LIBEWF_VERSION = "20240506"
+LIBEWF_RELEASE_URL = (
+    "https://github.com/libyal/libewf/releases/download/"
+    "{version}/libewf-experimental-{version}.tar.gz"
+)
+# The release tarball ships a pre-generated ``configure`` (no autotools needed).
+LIBEWF_BUILD_DEPS = [
+    "gcc", "make", "pkg-config", "zlib1g-dev", "libbz2-dev",
+    "libssl-dev", "libfuse-dev",
+]
+
+# Marker written once first-run bootstrap (system tools) has completed.
+_MARKER_CANDIDATES = [
+    Path("/var/lib/mountir/.bootstrapped"),
+    SCRIPT_DIR / ".mountir_bootstrapped",
+]
+
+# Opt out of automatic first-run bootstrapping (venv + system tools).
+_OPT_OUT_ENV = "MOUNTIR_NO_BOOTSTRAP"
+# Set on the child process after re-exec, to detect "already inside the venv".
+_IN_VENV_ENV = "MOUNTIR_IN_VENV"
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+def _opted_out() -> bool:
+    """True when the user has disabled automatic bootstrapping."""
+    return bool(os.environ.get(_OPT_OUT_ENV))
+
+
+def is_root() -> bool:
+    """True when running as root on a POSIX system (no-op elsewhere)."""
+    if hasattr(os, "geteuid"):
+        return os.geteuid() == 0
+    return False
+
+
+def _ensure_console_logger() -> None:
+    """Attach a minimal stderr logger if none is configured yet.
+
+    Bootstrap may run before ``setup_logging`` (we re-exec into the venv before
+    full logging is set up), so progress messages would otherwise be dropped.
+    Only the pre-exec process hits this; the re-exec'd process configures
+    logging normally.
+    """
+    if logger.handlers:
+        return
+    logger.setLevel(logging.INFO)
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setLevel(logging.INFO)
+    handler.setFormatter(logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    ))
+    logger.addHandler(handler)
+
+
+def missing_system_tools() -> List[str]:
+    """Return the list of declared tools that are not on PATH."""
+    return [tool for tool in SYSTEM_PACKAGES if not tool_exists(tool)]
+
+
+def missing_system_packages() -> List[str]:
+    """Return the apt packages needed to satisfy the missing tools."""
+    return sorted({SYSTEM_PACKAGES[t] for t in missing_system_tools()})
+
+
+def _marker_path() -> Path:
+    """Pick a writable marker location, preferring the system path."""
+    for candidate in _MARKER_CANDIDATES:
+        try:
+            candidate.parent.mkdir(parents=True, exist_ok=True)
+            return candidate
+        except OSError:
+            continue
+    return _MARKER_CANDIDATES[-1]
+
+
+def already_bootstrapped() -> bool:
+    """True if a bootstrap marker exists in any known location."""
+    return any(p.exists() for p in _MARKER_CANDIDATES)
+
+
+def _write_marker() -> None:
+    try:
+        _marker_path().write_text("ok\n", encoding="utf-8")
+    except OSError as e:
+        logger.debug("Could not write bootstrap marker: %s", e)
+
+
+# ---------------------------------------------------------------------------
+# Virtual environment management
+# ---------------------------------------------------------------------------
+def venv_python() -> Path:
+    """Path to the Python interpreter inside the project venv."""
+    if os.name == "nt":
+        return VENV_DIR / "Scripts" / "python.exe"
+    return VENV_DIR / "bin" / "python"
+
+
+def venv_exists() -> bool:
+    """True if the project venv has been created."""
+    return venv_python().exists()
+
+
+def in_project_venv() -> bool:
+    """True if the current interpreter is the project venv's interpreter."""
+    if os.environ.get(_IN_VENV_ENV):
+        return True
+    try:
+        return Path(sys.executable).resolve() == venv_python().resolve()
+    except OSError:
+        return False
+
+
+def _run_venv_module() -> bool:
+    """Create the venv with the current interpreter's ``venv`` module."""
+    try:
+        result = subprocess.run(
+            [sys.executable, "-m", "venv", str(VENV_DIR)],
+            text=True, timeout=180,
+        )
+        return result.returncode == 0
+    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+        logger.debug("venv module invocation failed: %s", e)
+        return False
+
+
+def create_venv() -> bool:
+    """Create the project virtual environment.
+
+    On Debian/Ubuntu the ``venv``/``ensurepip`` machinery lives in a separate
+    ``python3-venv`` package; if creation fails we try to install it and retry
+    once.
+    """
+    logger.info("Creating Python virtual environment at %s", VENV_DIR)
+    if _run_venv_module():
+        return True
+
+    logger.warning("venv creation failed - attempting to install python3-venv")
+    if install_system_deps(["python3-venv"]) and _run_venv_module():
+        return True
+
+    logger.error(
+        "Could not create a virtual environment. Install 'python3-venv' "
+        "(Debian/Ubuntu) and retry, or run with --no-setup to use the system "
+        "interpreter.",
+    )
+    return False
+
+
+def install_python_deps(python_exe: Optional[Path] = None) -> bool:
+    """Install/upgrade the pinned Python dependencies into the venv.
+
+    Returns True on success.
+    """
+    if not REQUIREMENTS_FILE.exists():
+        logger.warning("requirements.txt not found at %s", REQUIREMENTS_FILE)
+        return False
+
+    py = str(python_exe or venv_python())
+    logger.info("Installing pinned Python dependencies into the venv")
+    try:
+        result = subprocess.run(
+            [py, "-m", "pip", "install", "-r", str(REQUIREMENTS_FILE)],
+            text=True, timeout=300,
+        )
+        if result.returncode == 0:
+            logger.info("Python dependencies are satisfied")
+            return True
+        logger.warning("pip exited with code %d", result.returncode)
+        return False
+    except FileNotFoundError:
+        logger.error("pip not available for interpreter %s", py)
+        return False
+    except subprocess.TimeoutExpired:
+        logger.error("pip install timed out")
+        return False
+
+
+def ensure_venv_ready(force_install: bool = False) -> bool:
+    """Make sure the venv exists with the pinned deps installed.
+
+    The deps are installed when the venv is first created, or whenever
+    ``force_install`` is set (e.g. ``mountir setup``).  On subsequent runs an
+    existing venv is reused without re-running pip.
+    """
+    created = False
+    if not venv_exists():
+        if not create_venv():
+            return False
+        created = True
+    if created or force_install:
+        install_python_deps(venv_python())
+    return venv_exists()
+
+
+def reexec_into_venv() -> None:
+    """Re-run the current MountIR command using the venv interpreter.
+
+    Implemented with ``subprocess`` (rather than ``os.exec*``) so behaviour is
+    identical on Linux and Windows and stdio/exit codes propagate cleanly: the
+    child inherits stdin/stdout/stderr, so ``--json`` output and the banner go
+    to the right streams.  Exits the current process with the child's return
+    code; returns only if the venv interpreter is missing.
+    """
+    py = venv_python()
+    if not py.exists():
+        logger.error(
+            "Virtual environment python missing at %s; continuing with the "
+            "system interpreter", py,
+        )
+        return
+
+    env = os.environ.copy()
+    env[_IN_VENV_ENV] = "1"
+    script = SCRIPT_DIR / "mountir.py"
+    argv = [str(py), str(script)] + sys.argv[1:]
+
+    logger.info("Re-launching MountIR inside the virtual environment")
+    sys.stdout.flush()
+    sys.stderr.flush()
+    try:
+        result = subprocess.run(argv, env=env)
+    except KeyboardInterrupt:
+        sys.exit(130)
+    sys.exit(result.returncode)
+
+
+# ---------------------------------------------------------------------------
+# System package install
+# ---------------------------------------------------------------------------
+def _priv_prefix() -> Optional[List[str]]:
+    """Privilege-escalation prefix for system-modifying commands.
+
+    Returns ``[]`` when already root, ``["sudo"]`` when sudo is available, or
+    ``None`` when neither (caller must abort the privileged action).
+    """
+    if is_root():
+        return []
+    if tool_exists("sudo"):
+        return ["sudo"]
+    return None
+
+
+def _run(cmd: List[str], cwd: Optional[Path] = None, timeout: int = 300) -> bool:
+    """Run a build/install command, returning True on success.  Never raises."""
+    try:
+        result = subprocess.run(
+            cmd, cwd=str(cwd) if cwd else None, text=True, timeout=timeout,
+        )
+        if result.returncode != 0:
+            logger.warning("command failed (%d): %s", result.returncode, " ".join(cmd))
+            return False
+        return True
+    except FileNotFoundError:
+        logger.warning("command not found: %s", cmd[0])
+        return False
+    except subprocess.TimeoutExpired:
+        logger.warning("command timed out: %s", " ".join(cmd))
+        return False
+
+
+def install_system_deps(packages: List[str]) -> bool:
+    """Install the given apt packages.  Requires root (or sudo)."""
+    if not packages:
+        logger.info("All required system tools are already installed")
+        return True
+
+    # Choose a privilege escalation strategy.
+    prefix = _priv_prefix()
+    if prefix is None:
+        logger.error(
+            "Cannot install system packages without root. Run as root or "
+            "install manually: apt install %s", " ".join(packages),
+        )
+        return False
+
+    logger.info("Installing system packages: %s", " ".join(packages))
+    try:
+        subprocess.run(prefix + ["apt-get", "update", "-qq"],
+                       text=True, timeout=180)
+        result = subprocess.run(
+            prefix + ["apt-get", "install", "-y"] + packages,
+            text=True, timeout=600,
+        )
+        if result.returncode == 0:
+            logger.info("System packages installed successfully")
+            return True
+        logger.warning("Some packages may have failed to install")
+        return False
+    except FileNotFoundError:
+        logger.error(
+            "apt-get not found. MountIR auto-install targets Debian/Ubuntu. "
+            "Install manually: %s", " ".join(packages),
+        )
+        return False
+    except subprocess.TimeoutExpired:
+        logger.error("System package installation timed out")
+        return False
+
+
+def build_apfs_fuse(force: bool = False) -> bool:
+    """Build and install apfs-fuse from source (it isn't packaged for apt).
+
+    Read-only APFS support on Linux comes from ``apfs-fuse``
+    (github.com/sgan81/apfs-fuse).  Best-effort: installs the build
+    dependencies, clones the repo with submodules, runs ``cmake`` + ``make``,
+    and installs the binaries into ``/usr/local/bin``.  Never raises; returns
+    True only when an ``apfs-fuse`` binary ends up on PATH.
+    """
+    if not force and tool_exists("apfs-fuse"):
+        logger.debug("apfs-fuse already installed")
+        return True
+
+    prefix = _priv_prefix()
+    if prefix is None:
+        logger.error(
+            "Cannot build apfs-fuse without root. Run as root/sudo, or build "
+            "manually from %s", APFS_FUSE_REPO,
+        )
+        return False
+
+    logger.info("Building apfs-fuse from source (no apt package available)")
+    if not install_system_deps(APFS_FUSE_BUILD_DEPS):
+        logger.warning("Could not install apfs-fuse build dependencies")
+        return False
+
+    src = _SOURCE_BUILD_ROOT / "apfs-fuse"
+    build = src / "build"
+    try:
+        _SOURCE_BUILD_ROOT.mkdir(parents=True, exist_ok=True)
+        if not (src / ".git").exists():
+            if not _run(["git", "clone", "--recursive", APFS_FUSE_REPO, str(src)],
+                        timeout=600):
+                return False
+        build.mkdir(parents=True, exist_ok=True)
+        if not _run(["cmake", ".."], cwd=build, timeout=300):
+            return False
+        if not _run(["make", "-j"], cwd=build, timeout=1800):
+            return False
+        for name in ("apfs-fuse", "apfsutil", "apfs-dump", "apfs-dump-quick"):
+            binary = build / name
+            if binary.exists():
+                _run(prefix + ["install", "-m", "0755", str(binary), "/usr/local/bin/"],
+                     timeout=60)
+    except OSError as e:
+        logger.warning("apfs-fuse build failed: %s", e)
+        return False
+
+    if tool_exists("apfs-fuse"):
+        logger.info("apfs-fuse installed to /usr/local/bin")
+        return True
+    logger.warning("apfs-fuse build finished but the binary isn't on PATH")
+    return False
+
+
+def installed_ewfmount_version() -> Optional[str]:
+    """Return the installed ``ewfmount`` version (``YYYYMMDD``) or None.
+
+    libewf tools print ``ewfmount YYYYMMDD`` as the first line of ``-V`` output
+    (to stdout, though we read stderr too defensively).
+    """
+    if not tool_exists("ewfmount"):
+        return None
+    try:
+        result = subprocess.run(
+            ["ewfmount", "-V"], capture_output=True, text=True, timeout=10,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return None
+    match = re.search(r"ewfmount\s+(\d{8})", (result.stdout or "") + (result.stderr or ""))
+    return match.group(1) if match else None
+
+
+def have_modern_libewf(minimum: str = LIBEWF_VERSION) -> bool:
+    """True when the installed ``ewfmount`` is new enough for EWF2 (Ex01/Lx01).
+
+    The apt ``ewf-tools`` package is the 2014 legacy line (20140807) and reports
+    a version below the pinned modern release; a source-built libewf reports
+    ``minimum`` or newer.  Versions are ``YYYYMMDD`` integers, so a numeric
+    compare orders them correctly.
+    """
+    version = installed_ewfmount_version()
+    if not version:
+        return False
+    try:
+        return int(version) >= int(minimum)
+    except ValueError:
+        return False
+
+
+def _download(url: str, dest: Path, timeout: int = 180) -> bool:
+    """Download ``url`` to ``dest`` with urllib (follows redirects).  No raise."""
+    import urllib.error
+    import urllib.request
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:  # nosec B310 - https only
+            data = resp.read()
+        dest.write_bytes(data)
+        return dest.stat().st_size > 0
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        logger.warning("download failed for %s: %s", url, e)
+        return False
+
+
+def _extract_tarball(tarball: Path, dest: Path) -> Optional[Path]:
+    """Extract a ``.tar.gz`` into ``dest``; return the top-level extracted dir."""
+    import tarfile
+    try:
+        with tarfile.open(tarball, "r:gz") as tf:
+            names = tf.getnames()
+            try:
+                tf.extractall(dest, filter="data")  # safe extraction (py3.12+)
+            except TypeError:
+                tf.extractall(dest)  # older Python without the filter kwarg
+    except (tarfile.TarError, OSError) as e:
+        logger.warning("could not extract %s: %s", tarball.name, e)
+        return None
+    tops = {n.split("/", 1)[0] for n in names if n and not n.startswith("/")}
+    return dest / next(iter(tops)) if len(tops) == 1 else dest
+
+
+def build_libewf(force: bool = False, version: str = "") -> bool:
+    """Build and install modern libewf from source for EWF2 (Ex01/Lx01) support.
+
+    The apt ``ewf-tools`` package is frozen at the 2014 legacy line (20140807),
+    which cannot read EnCase v7 EWF2 (Ex01/Lx01) images.  This downloads the
+    maintained libyal release (pinned to :data:`LIBEWF_VERSION`, overridable via
+    the ``MOUNTIR_LIBEWF_VERSION`` env var), runs its bundled
+    ``./configure && make && make install`` into ``/usr/local``, and refreshes
+    the dynamic linker cache so the freshly built ``ewfmount`` shadows the apt
+    one.  Best-effort: never raises; returns True only when a modern ``ewfmount``
+    ends up on PATH.
+
+    ``force`` rebuilds even when a modern libewf is already installed (used by
+    ``mountir setup --force`` to pull a newer pinned/override version).
+    """
+    version = version or os.environ.get("MOUNTIR_LIBEWF_VERSION") or LIBEWF_VERSION
+    if not force and have_modern_libewf():
+        logger.debug("modern libewf already installed (Ex01/Lx01 supported)")
+        return True
+
+    url = LIBEWF_RELEASE_URL.format(version=version)
+    prefix = _priv_prefix()
+    if prefix is None:
+        logger.error(
+            "Cannot build libewf without root. Run as root/sudo, or build "
+            "manually from %s", url,
+        )
+        return False
+
+    logger.info(
+        "Building libewf %s from source (apt ewf-tools is the 2014 legacy "
+        "line; this adds EWF2 Ex01/Lx01 support)", version,
+    )
+    if not install_system_deps(LIBEWF_BUILD_DEPS):
+        logger.warning("Could not install libewf build dependencies")
+        return False
+
+    tarball = _SOURCE_BUILD_ROOT / f"libewf-{version}.tar.gz"
+    try:
+        _SOURCE_BUILD_ROOT.mkdir(parents=True, exist_ok=True)
+        if not _download(url, tarball):
+            logger.warning("Could not download libewf source from %s", url)
+            return False
+        src = _extract_tarball(tarball, _SOURCE_BUILD_ROOT)
+        if src is None:
+            return False
+        if not _run(["./configure"], cwd=src, timeout=600):
+            return False
+        if not _run(["make", "-j"], cwd=src, timeout=1800):
+            return False
+        if not _run(prefix + ["make", "install"], cwd=src, timeout=300):
+            return False
+        _run(prefix + ["ldconfig"], timeout=60)  # register /usr/local/lib
+    except OSError as e:
+        logger.warning("libewf build failed: %s", e)
+        return False
+
+    if have_modern_libewf(version):
+        logger.info("libewf %s installed to /usr/local (Ex01/Lx01 enabled)", version)
+        return True
+    logger.warning("libewf build finished but a modern ewfmount isn't on PATH")
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Orchestration
+# ---------------------------------------------------------------------------
+def ensure_venv_runtime() -> None:
+    """Ensure MountIR runs inside the project venv (call early in ``main``).
+
+    On first run this creates the venv, installs the pinned Python deps, and
+    re-execs the current command with the venv interpreter.  It is a no-op once
+    inside the venv or when bootstrapping is opted out, and never raises - a
+    failed venv bootstrap must not stop the user from running a command.
+    """
+    if _opted_out():
+        return
+    if in_project_venv():
+        return
+
+    _ensure_console_logger()
+    if not venv_exists():
+        logger.info("First run detected - setting up MountIR virtual environment")
+    try:
+        if ensure_venv_ready():
+            reexec_into_venv()  # replaces the process; only returns on failure
+    except Exception as e:  # never let bootstrap crash the CLI
+        logger.warning("venv bootstrap encountered an error: %s", e)
+
+
+def ensure_system_bootstrap() -> None:
+    """Install missing system forensic tools once (call after venv re-exec)."""
+    if _opted_out():
+        return
+    if already_bootstrapped():
+        return
+    logger.info("First run - installing missing system forensic tools")
+    try:
+        install_system_deps(missing_system_packages())
+    except Exception as e:  # never let bootstrap crash the CLI
+        logger.warning("System tool bootstrap encountered an error: %s", e)
+    if not tool_exists("apfs-fuse"):
+        logger.info(
+            "APFS images need apfs-fuse (built from source) - run "
+            "'mountir setup' to build it.")
+    if not have_modern_libewf():
+        logger.info(
+            "EnCase v7 EWF2 (Ex01/Lx01) images need modern libewf (built from "
+            "source) - run 'mountir setup' to build it.")
+    _write_marker()
+
+
+def run_bootstrap(force: bool = False) -> bool:
+    """Full dependency install for ``mountir setup``.
+
+    Creates/refreshes the venv with the pinned Python deps and installs any
+    missing system forensic tools.  Does not re-exec (the caller is performing
+    setup, not a mount operation).
+    """
+    logger.info("Bootstrapping MountIR dependencies...")
+    venv_ok = ensure_venv_ready(force_install=True)
+
+    packages = missing_system_packages()
+    if packages:
+        logger.info("Missing system tools require: %s", " ".join(packages))
+    sys_ok = install_system_deps(packages)
+
+    # APFS has no apt package; build the FUSE driver from source on demand.
+    # A failed optional build is reported but doesn't fail the whole setup.
+    if not build_apfs_fuse(force=force):
+        logger.warning(
+            "apfs-fuse is unavailable - APFS images won't mount until it builds "
+            "(needs a compiler + network). Re-run 'mountir setup' to retry.")
+
+    # apt ewf-tools is the 2014 legacy line; build modern libewf for EWF2.
+    if not build_libewf(force=force):
+        logger.warning(
+            "Modern libewf is unavailable - EnCase v7 EWF2 (Ex01/Lx01) images "
+            "won't mount until it builds (needs a compiler + network). Re-run "
+            "'mountir setup' to retry.")
+
+    _write_marker()
+
+    if venv_ok and sys_ok:
+        logger.info("Bootstrap complete - MountIR is ready")
+        logger.info("Python dependencies live in %s", VENV_DIR)
+    else:
+        logger.warning(
+            "Bootstrap finished with warnings. Run 'mountir check' to review "
+            "remaining gaps.",
+        )
+    return venv_ok and sys_ok
