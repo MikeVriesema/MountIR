@@ -101,7 +101,19 @@ class StateManager:
             self._cache = state
             return self._cache
 
-        except (json.JSONDecodeError, TypeError, KeyError) as e:
+        except PermissionError:
+            # The state file is created root-owned by mount/unmount; the
+            # read-only `list`/`check` commands may run unprivileged and can't
+            # read it. Degrade to an empty view with an actionable hint rather
+            # than crashing.
+            logger.warning(
+                "Cannot read state file %s without privileges - run with sudo "
+                "to see tracked mounts.", self.state_file,
+            )
+            self._cache = MountState()
+            return self._cache
+
+        except (json.JSONDecodeError, TypeError, KeyError, OSError) as e:
             logger.warning("Failed to parse state file: %s", e)
             self._cache = MountState()
             return self._cache

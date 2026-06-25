@@ -31,7 +31,10 @@ from utils import (
     find_mounts_under, loop_devices_backing,
     Fore, Style, HAS_COLOR,
 )
-from detector import ImageType, detect_image_type, SUPPORTED_FORMATS
+from detector import (
+    ImageType, detect_image_type, find_images_in_dir, is_bundle_image,
+    _is_secondary_segment, SUPPORTED_FORMATS,
+)
 from handlers import get_handler, ALL_HANDLER_CLASSES, NO_PARTITION_TYPES
 from handlers.base import MountResult
 from partition import (
@@ -73,7 +76,13 @@ def print_banner():
 # Command: mount
 # ---------------------------------------------------------------------------
 def cmd_mount(args):
-    """Mount a forensic disk image."""
+    """Mount one or more forensic disk images.
+
+    Accepts a single image, several images/globs, or a directory to scan for
+    every recognised image inside it (see :func:`_collect_images`).  Each image
+    is mounted independently under its own ``<mount-base>/<mount-id>`` tree; a
+    failure on one image is logged and the rest still mount.
+    """
     # Handle JSON input mode (Whirlpool integration)
     if args.json_input:
         _apply_json_input(args)
@@ -83,19 +92,65 @@ def cmd_mount(args):
         logger.error("MountIR requires root privileges. Run with sudo.")
         sys.exit(1)
 
-    # Resolve image path
-    image_path = Path(args.image_path).resolve()
+    # Resolve the image list (expands directories and globs).
+    images = _collect_images(args)
+    if not images:
+        logger.error("No image(s) found to mount")
+        sys.exit(1)
+
+    multi = len(images) > 1
+    if multi:
+        logger.info("Found %d image(s) to mount", len(images))
+
+    state_mgr = StateManager()
+    json_objects = []
+    success = 0
+    for image_path in images:
+        outcome = _mount_one_image(image_path, args, state_mgr)
+        if outcome is None:
+            continue
+        success += 1
+        mounted, partition_infos = outcome
+        if getattr(args, "json", False):
+            json_objects.append(_build_json_output(mounted, partition_infos))
+
+    if multi:
+        logger.info("Mounted %d of %d image(s)", success, len(images))
+
+    if getattr(args, "json", False):
+        # Preserve the single-object shape for back-compat (Whirlpool); only
+        # wrap in a list when several images were mounted in one invocation.
+        if multi:
+            print(json.dumps({"mounts": json_objects}, indent=2))
+        elif json_objects:
+            print(json.dumps(json_objects[0], indent=2))
+
+    # A single explicit image that failed should be a hard error (exit 1), as
+    # before; a multi-image run is best-effort and only fails if nothing mounted.
+    if success == 0:
+        sys.exit(1)
+
+
+def _mount_one_image(image_path: Path, args, state_mgr: StateManager):
+    """Mount a single image and record its state.
+
+    Returns ``(MountedImage, [PartitionInfo, ...])`` on success, or ``None`` on
+    failure (after logging).  Never raises for a per-image problem, so a
+    multi-image run keeps going.
+    """
+    force = getattr(args, "force", False)
+
     if not image_path.exists():
         logger.error("Image not found: %s", image_path)
-        sys.exit(1)
+        return None
 
     # Detect image type
     image_type = detect_image_type(image_path)
     if image_type == ImageType.UNKNOWN:
         logger.error("Unrecognized image format: %s", image_path)
         logger.error("Supported formats: %s", SUPPORTED_FORMATS)
-        sys.exit(1)
-    logger.info("Detected image type: %s", image_type.value.upper())
+        return None
+    logger.info("Detected image type: %s (%s)", image_type.value.upper(), image_path.name)
 
     # Get handler and check tools
     handler = get_handler(image_type)
@@ -106,7 +161,7 @@ def cmd_mount(args):
             handler.format_name, ", ".join(tool_status["missing"]),
         )
         logger.error("Install dependencies with: mountir setup")
-        sys.exit(1)
+        return None
     if tool_status.get("fallback_in_use"):
         logger.info("Using fallback tools for %s", handler.format_name)
 
@@ -125,9 +180,9 @@ def cmd_mount(args):
     logger.info("Mounting container: %s", image_path.name)
     result = handler.mount(image_path, container_dir)
     if not result.success:
-        logger.error("Container mount failed: %s", result.error)
+        logger.error("Container mount failed (%s): %s", image_path.name, result.error)
         cleanup_mount_dir(image_mount_dir)
-        sys.exit(1)
+        return None
 
     # Track state for building the MountedImage
     secondary_loop = ""
@@ -150,7 +205,7 @@ def cmd_mount(args):
             str(result.raw_image_path) if result.raw_image_path else ""
         )
         if backing:
-            partition_infos, partition_loops = expose_partitions(backing)
+            partition_infos, partition_loops = expose_partitions(backing, force=force)
 
             # LVM physical volumes may live on the exposed partition devices.
             part_devices = [p.device for p in partition_infos if p.device]
@@ -165,7 +220,7 @@ def cmd_mount(args):
         # Mount each partition
         for part in partition_infos:
             part_mount = partitions_dir / _partition_dir_name(part)
-            mount_partition(part, part_mount)
+            mount_partition(part, part_mount, force=force)
 
         # Import any ZFS pools living on the exposed devices (read-only). The
         # zfs_member partitions above are intentionally skipped by
@@ -180,7 +235,6 @@ def cmd_mount(args):
         )
 
     # Save state
-    state_mgr = StateManager()
     mounted = MountedImage(
         mount_id=mount_id,
         image_path=str(image_path),
@@ -220,9 +274,68 @@ def cmd_mount(args):
     if getattr(args, "maelstrom", False):
         _invoke_maelstrom(partition_infos, image_mount_dir, args)
 
-    # JSON output for Whirlpool
-    if getattr(args, "json", False):
-        _print_json_output(mounted, partition_infos)
+    return mounted, partition_infos
+
+
+def _collect_images(args):
+    """Resolve the ``mount`` arguments into a de-duplicated list of image paths.
+
+    Each entry may be a single image file, a shell glob (also expanded here so
+    quoted patterns work), or a directory to scan for recognised images
+    (honouring ``--recursive`` and ``--pattern``).  Explicit files are taken
+    as-is (type detection happens later); directory scans skip continuation
+    segments so a multi-part set resolves to one mount.
+    """
+    import glob
+
+    raw = getattr(args, "image_path", None)
+    if isinstance(raw, str):
+        raw = [raw]
+    raw = raw or []
+
+    recursive = getattr(args, "recursive", False)
+    pattern = getattr(args, "pattern", None)
+
+    images = []
+    seen = set()
+
+    def _add(path: Path) -> None:
+        try:
+            key = str(path.resolve())
+        except OSError:
+            key = str(path)
+        if key not in seen:
+            seen.add(key)
+            images.append(path)
+
+    for entry in raw:
+        has_glob = any(c in entry for c in "*?[")
+        matches = sorted(glob.glob(entry))
+        if has_glob and not matches:
+            logger.warning("No files matched pattern: %s", entry)
+            continue
+        expanded = [Path(p) for p in matches] or [Path(entry)]
+        for p in expanded:
+            # A directory is scanned for images -- unless it's itself a bundle
+            # image (macOS .sparsebundle), which we mount rather than scan into.
+            if p.is_dir() and not is_bundle_image(p):
+                found = find_images_in_dir(p, recursive=recursive, pattern=pattern)
+                if not found:
+                    logger.warning("No mountable images found in directory: %s", p)
+                for f in found:
+                    _add(f)
+            elif p.exists():
+                # A wildcard behaves like a mini directory scan, so drop
+                # continuation pieces (e.g. '<set>.*' matching .E02/.002). An
+                # explicitly-named single file is always taken as-is.
+                if has_glob and _is_secondary_segment(p):
+                    logger.debug("Skipping continuation segment from glob: %s", p)
+                    continue
+                _add(p)
+            else:
+                logger.error("Image not found: %s", p)
+
+    return images
 
 
 def _import_zfs_pools(partition_infos, image_mount_dir: Path):
@@ -362,12 +475,23 @@ def _print_mount_summary(mount_id, image_path, image_type, result,
                 print(f"    {p.device:<20} {fs_info:<16} {_skip('skipped')}",
                       file=sys.stderr)
 
+    # In best-effort (--force) mode, surface the raw block devices of anything
+    # that couldn't be mounted so the analyst can image/carve them directly.
+    if getattr(args, "force", False):
+        raw_devices = [p.device for p in partitions
+                       if p.device and not p.mounted and p.mount_error]
+        if raw_devices:
+            print(f"\n  {'Raw devices:':<18} (exposed for carving / manual mount)",
+                  file=sys.stderr)
+            for dev in raw_devices:
+                print(f"    {dev}", file=sys.stderr)
+
     print(file=sys.stderr)
 
 
-def _print_json_output(mounted, partitions):
-    """Print JSON output for machine consumption."""
-    output = {
+def _build_json_output(mounted, partitions) -> dict:
+    """Build the machine-readable result object for one mounted image."""
+    return {
         "mount_id": mounted.mount_id,
         "image_path": mounted.image_path,
         "image_type": mounted.image_type,
@@ -385,7 +509,6 @@ def _print_json_output(mounted, partitions):
             for p in partitions
         ],
     }
-    print(json.dumps(output, indent=2))
 
 
 def _invoke_maelstrom(partitions, image_mount_dir, args):
@@ -558,13 +681,37 @@ def _unmount_single(mounted: MountedImage, state_mgr: StateManager) -> bool:
 # ---------------------------------------------------------------------------
 # Command: list
 # ---------------------------------------------------------------------------
+def _filter_by_base(images, mount_base):
+    """Return only images whose mount_base is at or under *mount_base*.
+
+    ``mount_base`` of None means "no filter" (list everything).  Comparison is
+    on the resolved path so ``-d /mnt/mountir`` matches a mount recorded with a
+    trailing slash or a relative form.
+    """
+    if not mount_base:
+        return list(images)
+    base = str(Path(mount_base).resolve()).rstrip("/")
+    matched = []
+    for img in images:
+        mb = str(Path(img.mount_base).resolve()).rstrip("/") if img.mount_base else ""
+        if mb == base or mb.startswith(base + "/"):
+            matched.append(img)
+    return matched
+
+
 def cmd_list(args):
-    """List currently mounted disk images."""
+    """List currently mounted disk images (optionally filtered by base dir)."""
     state_mgr = StateManager()
     state = state_mgr.load()
 
-    if not state.mounted_images:
-        logger.info("No mounted images")
+    mount_base = getattr(args, "mount_base", None)
+    images = _filter_by_base(state.mounted_images, mount_base)
+
+    if not images:
+        if mount_base:
+            logger.info("No mounted images under %s", mount_base)
+        else:
+            logger.info("No mounted images")
         return
 
     # Check for stale mounts
@@ -574,8 +721,9 @@ def cmd_list(args):
     if getattr(args, "json", False):
         from dataclasses import asdict
         output = {
-            "mounted_images": [asdict(img) for img in state.mounted_images],
-            "stale_mount_ids": list(stale_ids),
+            "mounted_images": [asdict(img) for img in images],
+            "stale_mount_ids": [i for i in stale_ids
+                                if any(img.mount_id == i for img in images)],
         }
         print(json.dumps(output, indent=2))
         return
@@ -583,10 +731,10 @@ def cmd_list(args):
     _h = lambda s: f"{Fore.CYAN}{Style.BRIGHT}{s}{Style.RESET_ALL}" if HAS_COLOR else s
 
     print(file=sys.stderr)
-    print(_h(f"Mounted Images ({len(state.mounted_images)})"), file=sys.stderr)
+    print(_h(f"Mounted Images ({len(images)})"), file=sys.stderr)
     print(_h("=" * 70), file=sys.stderr)
 
-    for img in state.mounted_images:
+    for img in images:
         status = ""
         if img.mount_id in stale_ids:
             status = f" {Fore.YELLOW}[STALE]{Style.RESET_ALL}" if HAS_COLOR else " [STALE]"
@@ -613,11 +761,12 @@ def cmd_list(args):
 
     print(file=sys.stderr)
 
-    if stale:
+    listed_stale = [img for img in images if img.mount_id in stale_ids]
+    if listed_stale:
         logger.warning(
             "%d stale mount(s) detected (may have been lost after reboot). "
             "Use 'unmount --all' to clean state.",
-            len(stale),
+            len(listed_stale),
         )
 
 
@@ -676,6 +825,7 @@ def cmd_check(args):
             )
         output["ewfmount_version"] = bootstrap.installed_ewfmount_version()
         output["ewfmount_modern"] = bootstrap.have_modern_libewf()
+        output["ewfmount_path"] = bootstrap.best_ewfmount()
         print(json.dumps(output, indent=2))
         return
 
@@ -699,14 +849,19 @@ def cmd_check(args):
             print(f"  {'':14} Install: sudo apt install {pkg}", file=sys.stderr)
 
     # ewfmount: apt ships the 2014 legacy line (no EWF2); flag whether the
-    # installed build can read EnCase v7 Ex01/Lx01 images.
+    # installed build can read EnCase v7 Ex01/Lx01 images. We report the
+    # *newest* ewfmount found and the exact path MountIR will invoke, since
+    # PATH/sudo secure_path may otherwise surface the legacy build first.
     ewf_ver = bootstrap.installed_ewfmount_version()
+    ewf_path = bootstrap.best_ewfmount()
     if ewf_ver:
         if bootstrap.have_modern_libewf():
             note = _ok(f"v{ewf_ver}: modern, Ex01/Lx01 supported")
         else:
             note = _miss(f"v{ewf_ver}: legacy, no Ex01/Lx01")
         print(f"  {'':14} {note}", file=sys.stderr)
+        if ewf_path:
+            print(f"  {'':14} Using: {ewf_path}", file=sys.stderr)
         if not bootstrap.have_modern_libewf():
             print(f"  {'':14} Build modern libewf: mountir setup",
                   file=sys.stderr)
@@ -870,12 +1025,27 @@ def build_parser() -> argparse.ArgumentParser:
     # --- mount ---
     mount_parser = subparsers.add_parser("mount", help="Mount a forensic disk image")
     mount_parser.add_argument(
-        "image_path", nargs="?",
-        help="Path to the disk image file",
+        "image_path", nargs="*",
+        help="One or more image files, globs, or a directory to scan for images",
     )
     mount_parser.add_argument(
-        "--mount-base", default="/mnt/mountir",
+        "-d", "--mount-base", "--dir", dest="mount_base", default="/mnt/mountir",
+        metavar="DIR",
         help="Base directory for mount points (default: /mnt/mountir)",
+    )
+    mount_parser.add_argument(
+        "-r", "--recursive", action="store_true",
+        help="When a directory is given, scan it recursively for images",
+    )
+    mount_parser.add_argument(
+        "--pattern", metavar="GLOB",
+        help="Only mount files matching this glob when scanning a directory "
+             "(e.g. '*.E01')",
+    )
+    mount_parser.add_argument(
+        "--force", "--best-effort", dest="force", action="store_true",
+        help="Best-effort mount: survive corrupt partition tables (expose the "
+             "whole disk) and brute-force the filesystem type regardless of OS",
     )
     mount_parser.add_argument(
         "--case-id", default="",
@@ -917,6 +1087,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     # --- list ---
     list_parser = subparsers.add_parser("list", help="List mounted images")
+    list_parser.add_argument(
+        "-d", "--mount-base", "--dir", dest="mount_base", default=None,
+        metavar="DIR",
+        help="Only list images mounted under this base directory "
+             "(default: list all)",
+    )
     list_parser.add_argument("-v", "--verbose", action="store_true")
     list_parser.add_argument("--json", action="store_true",
                               help="Output results as JSON")
@@ -932,7 +1108,8 @@ def build_parser() -> argparse.ArgumentParser:
         "clean", help="Unmount and remove orphaned mounts under the mount base",
     )
     clean_parser.add_argument(
-        "--mount-base", default="/mnt/mountir",
+        "-d", "--mount-base", "--dir", dest="mount_base", default="/mnt/mountir",
+        metavar="DIR",
         help="Mount base to clean (default: /mnt/mountir)",
     )
     clean_parser.add_argument(

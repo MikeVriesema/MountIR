@@ -306,6 +306,72 @@ class TestMountAttempts:
         assert types[-1] is None
 
 
+class TestForceMountSweep:
+    """--force adds a 'mount anyway' sweep regardless of OS/filesystem."""
+
+    def test_unknown_fs_force_sweeps_many_types(self):
+        normal = _mount_attempts("", force=False)
+        forced = _mount_attempts("", force=True)
+        assert normal == [(None, _DEFAULT_MOUNT_OPTIONS)]
+        forced_types = {t for t, _ in forced}
+        # Brute-forces the common drivers across operating systems.
+        assert {"ntfs3", "ext4", "xfs", "btrfs", "vfat", "hfsplus", "ufs"} \
+            <= forced_types
+        assert len(forced) > len(normal)
+
+    def test_force_keeps_detected_type_first(self):
+        forced = _mount_attempts("ext4", force=True)
+        assert forced[0][0] == "ext4"          # detected type still tried first
+        # ...then the sweep follows with other drivers.
+        assert any(t == "ntfs3" for t, _ in forced)
+
+    def test_force_does_not_duplicate_attempts(self):
+        forced = _mount_attempts("ntfs", force=True)
+        assert len(forced) == len(set(forced)), "force sweep should de-dup attempts"
+
+    def test_force_offers_all_fuse_drivers_as_last_resort(self):
+        # Without force, a non-APFS/VMFS type has no FUSE binary commands.
+        assert _fuse_mount_commands("ext4", "/dev/loop3", Path("/mnt/x")) == []
+        # With force, every dedicated FUSE driver is offered as a fallback.
+        bins = [c[0] for c in _fuse_mount_commands(
+            "ext4", "/dev/loop3", Path("/mnt/x"), force=True)]
+        assert "apfs-fuse" in bins and "vmfs-fuse" in bins
+
+
+class TestForceWholeDiskFallback:
+    """--force exposes the whole disk when no usable partition table exists."""
+
+    def test_corrupt_table_exposes_whole_disk(self, tmp_path):
+        from partition import expose_partitions
+
+        img = tmp_path / "corrupt.raw"
+        img.write_bytes(b"\x00" * 4096)
+
+        with patch("partition._whole_volume_fs", return_value=("", "")), \
+             patch("partition.read_partition_table", return_value=[]), \
+             patch("partition._enrich_with_blkid"), \
+             patch("partition._attach_offset_loop", return_value="/dev/loop9"):
+            parts, created = expose_partitions(str(img), force=True)
+
+        assert len(parts) == 1
+        assert parts[0].device == "/dev/loop9"
+        assert created == ["/dev/loop9"]
+
+    def test_without_force_no_fallback(self, tmp_path):
+        from partition import expose_partitions
+
+        img = tmp_path / "corrupt.raw"
+        img.write_bytes(b"\x00" * 4096)
+
+        with patch("partition._whole_volume_fs", return_value=("", "")), \
+             patch("partition.read_partition_table", return_value=[]), \
+             patch("partition._attach_offset_loop", return_value="/dev/loop9"):
+            parts, created = expose_partitions(str(img), force=False)
+
+        assert parts == []
+        assert created == []
+
+
 class TestFuseMounters:
     """Standalone FUSE binaries (APFS/VMFS) have no `mount -t` helper."""
 

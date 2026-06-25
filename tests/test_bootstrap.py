@@ -110,8 +110,39 @@ class TestEwfmountVersion:
     """Parsing the installed ewfmount version and the EWF2 capability gate."""
 
     def test_none_when_tool_absent(self):
-        with patch("bootstrap.tool_exists", return_value=False):
+        # No ewfmount on PATH or in any known install dir.
+        with patch("bootstrap._candidate_ewfmount_paths", return_value=[]):
             assert bootstrap.installed_ewfmount_version() is None
+
+    def test_reports_newest_across_candidates(self):
+        # Legacy apt build + source-built modern build present: report the newer.
+        versions = {
+            "/usr/bin/ewfmount": "20140807",
+            "/usr/local/bin/ewfmount": "20240506",
+        }
+        with patch("bootstrap._candidate_ewfmount_paths",
+                   return_value=list(versions)), \
+             patch("bootstrap.ewfmount_version_of",
+                   side_effect=lambda p: versions[p]):
+            assert bootstrap.installed_ewfmount_version() == "20240506"
+
+    def test_best_ewfmount_prefers_newest(self):
+        # Even when the legacy build is listed first (PATH/secure_path order),
+        # best_ewfmount returns the EWF2-capable one.
+        versions = {
+            "/usr/bin/ewfmount": "20140807",
+            "/usr/local/bin/ewfmount": "20240506",
+        }
+        with patch("bootstrap._candidate_ewfmount_paths",
+                   return_value=list(versions)), \
+             patch("bootstrap.ewfmount_version_of",
+                   side_effect=lambda p: versions[p]):
+            assert bootstrap.best_ewfmount() == "/usr/local/bin/ewfmount"
+
+    def test_best_ewfmount_none_when_absent(self):
+        with patch("bootstrap._candidate_ewfmount_paths", return_value=[]), \
+             patch("bootstrap.tool_exists", return_value=False):
+            assert bootstrap.best_ewfmount() is None
 
     def test_parses_version_from_stdout(self):
         with patch("bootstrap.tool_exists", return_value=True), \

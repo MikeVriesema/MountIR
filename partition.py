@@ -388,7 +388,37 @@ def _whole_volume_fs(backing: str) -> Tuple[str, str]:
     return _detect_fs_via_file(backing), ""
 
 
-def expose_partitions(backing: Union[str, Path]) -> Tuple[List[PartitionInfo], List[str]]:
+def _expose_whole_disk(backing: str, backing_is_dev: bool, disk_size: int,
+                       created: List[str]) -> Tuple[List[PartitionInfo], List[str]]:
+    """Expose the entire backing as one device (best-effort fallback).
+
+    Used in --force mode when no usable partition table and no whole-volume
+    filesystem could be found (a corrupt table, an exotic container, or raw
+    media from an edge device).  We still hand back a block device for the whole
+    disk so the analyst can attempt a mount or carve it, rather than aborting.
+    """
+    device = backing
+    if not backing_is_dev:
+        loop = _attach_offset_loop(backing, 0, 0)  # whole disk
+        if not loop:
+            logger.error("Could not attach whole-disk loop for %s", backing)
+            return [], created
+        device = loop
+        created.append(loop)
+    logger.warning(
+        "No usable partition table on %s - exposing the whole disk for a "
+        "best-effort mount/carve (--force)", backing,
+    )
+    vol = PartitionInfo(
+        device=device, number=1, start_bytes=0, size_bytes=disk_size,
+        backing_loop="" if backing_is_dev else device,
+    )
+    _enrich_with_blkid(vol)  # may still name a fs the table reader missed
+    return [vol], created
+
+
+def expose_partitions(backing: Union[str, Path],
+                      force: bool = False) -> Tuple[List[PartitionInfo], List[str]]:
     """Read *backing*'s partition table and expose each partition as a device.
 
     *backing* may be a block device (``/dev/loopN``, ``/dev/nbdN``) or an image
@@ -396,6 +426,10 @@ def expose_partitions(backing: Union[str, Path]) -> Tuple[List[PartitionInfo], L
     kernel-scanned node if one already exists; otherwise we create a dedicated
     read-only offset loop device.  Each exposed partition is then probed for its
     filesystem type/label.
+
+    When *force* is set and no usable partition table (and no whole-volume
+    filesystem) is found, the entire backing is exposed as a single device so a
+    corrupt-table or unfamiliar disk can still be mounted/carved.
 
     Returns ``(partitions, created_loop_devices)`` where ``created_loop_devices``
     are the offset loops we attached and must detach on unmount.
@@ -435,6 +469,8 @@ def expose_partitions(backing: Union[str, Path]) -> Tuple[List[PartitionInfo], L
                        len(parts) - len(valid), backing)
     if not valid:
         logger.info("No valid partition table found on %s", backing)
+        if force:
+            return _expose_whole_disk(backing, backing_is_dev, disk_size, created)
         return [], created
 
     for p in valid:
@@ -591,13 +627,57 @@ def _short_mount_error(e: Exception) -> str:
     return str(e)
 
 
-def _mount_attempts(fs: str) -> List[Tuple[Optional[str], str]]:
+# Best-effort ("mount anyway") type sweep used in --force mode. Every known
+# Linux-mountable filesystem driver is tried read-only, so a volume with a
+# missing/wrong type hint, a damaged superblock, or an unfamiliar OS still
+# mounts when at all possible -- the scaffold for edge devices and odd disks.
+# Kept minimal (``ro`` only) to maximise the chance a stubborn driver accepts
+# the mount; the nicer forensic options were already tried by the normal path.
+_FORCE_TYPE_SWEEP: List[Tuple[Optional[str], str]] = [
+    ("ntfs3", "ro"),
+    ("ntfs-3g", "ro,force,show_sys_files,streams_interface=windows"),
+    ("ntfs", "ro"),
+    ("ext4", "ro,norecovery"),
+    ("ext3", "ro,norecovery"),
+    ("ext2", "ro"),
+    ("xfs", "ro,norecovery"),
+    ("btrfs", "ro,norecovery,usebackuproot"),
+    ("vfat", "ro"),
+    ("exfat", "ro"),
+    ("exfat-fuse", "ro"),
+    ("hfsplus", "ro,force"),
+    ("hfs", "ro"),
+    ("ufs", "ro,ufstype=ufs2"),
+    ("ufs", "ro,ufstype=44bsd"),
+    ("ufs", "ro,ufstype=sun"),
+    ("ufs", "ro,ufstype=old"),
+    ("iso9660", "ro"),
+    (None, "ro"),
+]
+
+
+def _mount_attempts(fs: str, force: bool = False) -> List[Tuple[Optional[str], str]]:
     """Ordered (filesystem-type-or-None, options) attempts for a partition.
 
     A type of ``None`` lets ``mount`` auto-detect. Every list ends with an
     auto-detect attempt so a partition still mounts when blkid couldn't name
     the type, or when the named driver isn't the one the kernel provides.
+
+    When *force* is set, the detected-type attempts are followed by an
+    aggressive "mount anyway" sweep over every known driver (see
+    :data:`_FORCE_TYPE_SWEEP`), so a damaged or unrecognised volume still mounts
+    regardless of operating system.
     """
+    base = _mount_attempts_base(fs)
+    if force:
+        # De-dup against the attempts already queued for the detected type so we
+        # don't repeat identical commands, but keep order (detected type first).
+        seen = set(base)
+        base = base + [a for a in _FORCE_TYPE_SWEEP if a not in seen]
+    return base
+
+
+def _mount_attempts_base(fs: str) -> List[Tuple[Optional[str], str]]:
     auto = (None, _DEFAULT_MOUNT_OPTIONS)
     if not fs:
         return [auto]
@@ -641,25 +721,42 @@ def _mount_attempts(fs: str) -> List[Tuple[Optional[str], str]]:
     return [(fs, _MOUNT_OPTIONS.get(fs, _DEFAULT_MOUNT_OPTIONS)), auto]
 
 
-def _fuse_mount_commands(fs: str, device: str, mount_point: Path) -> List[List[str]]:
+def _fuse_mount_commands(fs: str, device: str, mount_point: Path,
+                         force: bool = False) -> List[List[str]]:
     """Standalone-FUSE-binary mount commands for *fs*, in priority order.
 
     Returns an empty list for filesystems mounted via ``mount`` (the usual
     path). For APFS/VMFS the driver is a dedicated binary with no ``mount -t``
     helper, so we build ``binary <args> <device> <mount_point>`` directly.
+
+    In *force* mode every dedicated FUSE driver is offered as a last resort
+    (not just the one for the detected type), so an APFS/VMFS volume with a
+    missing or wrong type hint can still be tried.
     """
     commands: List[List[str]] = []
-    for binary, args in _FUSE_MOUNTERS.get(fs, []):
+    entries = list(_FUSE_MOUNTERS.get(fs, []))
+    if force:
+        for other_fs, mounters in _FUSE_MOUNTERS.items():
+            if other_fs == fs:
+                continue
+            entries.extend(mounters)
+    for binary, args in entries:
         commands.append([binary, *args, device, str(mount_point)])
     return commands
 
 
-def mount_partition(partition: PartitionInfo, mount_point: Path) -> PartitionInfo:
+def mount_partition(partition: PartitionInfo, mount_point: Path,
+                    force: bool = False) -> PartitionInfo:
     """Mount a single partition read-only with forensic flags.
 
     Tries the detected filesystem (with driver fallbacks) and finally an
     auto-detected mount, so partitions still mount when blkid couldn't name the
     type. Error-isolating: on failure it sets ``mount_error`` and never raises.
+
+    When *force* is set, a failed standard mount falls through to a "mount
+    anyway" sweep over every known driver (see :func:`_mount_attempts`), and all
+    dedicated FUSE drivers are tried -- so a damaged or unfamiliar volume mounts
+    regardless of operating system whenever the kernel can read it at all.
     """
     if not partition.device:
         partition.mount_error = partition.mount_error or "partition was not exposed"
@@ -676,7 +773,8 @@ def mount_partition(partition: PartitionInfo, mount_point: Path) -> PartitionInf
 
     # 1. Dedicated FUSE binaries (APFS/VMFS) have no kernel/`mount -t` driver,
     #    so try them first when the detected type calls for one.
-    for cmd in _fuse_mount_commands(partition.filesystem, partition.device, mount_point):
+    for cmd in _fuse_mount_commands(partition.filesystem, partition.device,
+                                    mount_point, force=force):
         try:
             run_command(cmd, capture=True)
         except FileNotFoundError:
@@ -696,8 +794,9 @@ def mount_partition(partition: PartitionInfo, mount_point: Path) -> PartitionInf
         )
         return partition
 
-    # 2. Standard mount with detected-type and driver fallbacks.
-    for fstype, options in _mount_attempts(partition.filesystem):
+    # 2. Standard mount with detected-type and driver fallbacks (plus the
+    #    aggressive "mount anyway" sweep when force is set).
+    for fstype, options in _mount_attempts(partition.filesystem, force=force):
         cmd = ["mount", "-o", options]
         if fstype:
             cmd.extend(["-t", fstype])

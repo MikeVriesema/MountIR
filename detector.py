@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """MountIR image type detection via file extension and magic bytes."""
 
+import re
 import subprocess
 from enum import Enum
 from pathlib import Path
@@ -79,6 +80,103 @@ def _is_e01_segment(ext: str) -> bool:
             r"^\.[eE]([0-9]{2}|[a-zA-Z]{2})$"
         )
     return bool(_E01_SEGMENT_PATTERN.match(ext))
+
+
+# ---------------------------------------------------------------------------
+# Multi-image / directory scanning
+# ---------------------------------------------------------------------------
+# Extensions that mark the *primary* (first/only) file of a mountable image.
+# Used when scanning a directory so a folder of evidence can be mounted in one
+# shot.  Continuation segments (.E02+, .002+) and VMDK split extents are
+# deliberately excluded so a multi-segment set mounts once, from its first file.
+PRIMARY_IMAGE_EXTENSIONS = frozenset(_EXTENSION_MAP.keys())
+
+# VMDK split extents (e.g. ``disk-s001.vmdk``, ``disk-f001.vmdk``,
+# ``disk-flat.vmdk``, ``disk-delta.vmdk``) share the ``.vmdk`` suffix with the
+# descriptor that actually drives the mount; skip the extents in a dir scan.
+_VMDK_EXTENT_RE = re.compile(r"-(s\d+|f\d+|flat|delta|sesparse)\.vmdk$", re.I)
+
+# Image "files" that are actually directories/bundles rather than regular files:
+# a macOS sparsebundle is a directory whose contents the handler reassembles.
+# These must be matched as images (not scanned into) during a directory walk.
+_DIRECTORY_IMAGE_EXTENSIONS = frozenset({".sparsebundle"})
+
+
+def is_bundle_image(path: Path) -> bool:
+    """True when *path* is a directory that is itself a mountable image.
+
+    The only current case is a macOS ``.sparsebundle`` (a directory bundle).
+    Callers use this to mount such a directory rather than scanning into it.
+    """
+    return path.is_dir() and path.suffix.lower() in _DIRECTORY_IMAGE_EXTENSIONS
+
+
+def _is_secondary_segment(path: Path) -> bool:
+    """True for files that are a continuation piece of a multi-part image.
+
+    These are mounted implicitly via their primary file (the EWF/raw set, the
+    VMDK descriptor), so a directory scan must not treat them as separate
+    images.
+    """
+    name = path.name.lower()
+    ext = path.suffix.lower()
+    # VMDK split extents share the .vmdk suffix with the descriptor that drives
+    # the mount, so they must be caught before the primary-extension check.
+    if _VMDK_EXTENT_RE.search(name):
+        return True
+    # A recognised primary extension (.e01, .001, .vmdk, ...) is the first/only
+    # file of a set, never a continuation piece.
+    if ext in PRIMARY_IMAGE_EXTENSIONS:
+        return False
+    # EWF continuation segments (.E02-.E99, .EAA-.EZZ).
+    if _is_e01_segment(ext):
+        return True
+    # Split raw beyond the first piece (.002, .003 ...); .001 is a primary ext.
+    if re.fullmatch(r"\.\d{3}", ext):
+        return True
+    return False
+
+
+def is_primary_image(path: Path) -> bool:
+    """True when *path* is the primary file (or bundle) of a mountable image."""
+    if _is_secondary_segment(path):
+        return False
+    if path.suffix.lower() in _DIRECTORY_IMAGE_EXTENSIONS:
+        return path.is_dir()           # macOS .sparsebundle is a directory
+    if not path.is_file():
+        return False
+    return path.suffix.lower() in PRIMARY_IMAGE_EXTENSIONS
+
+
+def _scan_match(path: Path) -> bool:
+    """A directory/glob match worth queuing: a regular file or a bundle image,
+    that isn't a continuation segment of a multi-part set."""
+    if _is_secondary_segment(path):
+        return False
+    if path.suffix.lower() in _DIRECTORY_IMAGE_EXTENSIONS:
+        return path.is_dir()
+    return path.is_file()
+
+
+def find_images_in_dir(
+    directory: Path,
+    recursive: bool = False,
+    pattern: Optional[str] = None,
+) -> list:
+    """Return the primary images inside *directory*, sorted by path.
+
+    With *pattern* (a glob such as ``*.E01``) only matching entries are returned;
+    otherwise every recognised primary image extension is matched.  Continuation
+    segments and VMDK extents are filtered out so multi-part sets resolve to a
+    single mount, and macOS ``.sparsebundle`` directories are matched as images
+    rather than scanned into.  *recursive* walks subdirectories.
+    """
+    globber = directory.rglob if recursive else directory.glob
+    if pattern:
+        # Even with an explicit pattern, drop continuation segments so e.g.
+        # '*.E0*' doesn't queue every segment of one set as separate images.
+        return [p for p in sorted(globber(pattern)) if _scan_match(p)]
+    return [p for p in sorted(globber("*")) if is_primary_image(p)]
 
 
 def detect_image_type(image_path: Path) -> ImageType:

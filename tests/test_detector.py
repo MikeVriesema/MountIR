@@ -6,7 +6,10 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from detector import ImageType, detect_image_type, _is_e01_segment, _EXTENSION_MAP
+from detector import (
+    ImageType, detect_image_type, find_images_in_dir, is_primary_image,
+    is_bundle_image, _is_e01_segment, _is_secondary_segment, _EXTENSION_MAP,
+)
 
 
 class TestExtensionMapping:
@@ -154,3 +157,88 @@ class TestEdgeCases:
         with patch("detector.run_command", return_value=mock_result):
             result = detect_image_type(test_file)
             assert result == ImageType.E01
+
+
+class TestSecondarySegments:
+    """Continuation segments are recognised so dir scans skip them."""
+
+    @pytest.mark.parametrize("name", [
+        "disk.E02", "disk.E99", "disk.EAA",          # EWF continuation
+        "disk.002", "disk.003",                       # split-raw continuation
+        "disk-s001.vmdk", "disk-f002.vmdk",           # VMDK split extents
+        "disk-flat.vmdk", "disk-delta.vmdk",          # VMDK flat/delta extents
+    ])
+    def test_secondary_segment_detected(self, name):
+        assert _is_secondary_segment(Path(name)) is True
+
+    @pytest.mark.parametrize("name", [
+        "disk.E01", "disk.001", "disk.vmdk", "disk.dd", "disk.Ex01",
+    ])
+    def test_primary_not_flagged_as_secondary(self, name):
+        assert _is_secondary_segment(Path(name)) is False
+
+
+class TestFindImagesInDir:
+    """Directory scanning for multi-image mounting."""
+
+    def _touch(self, directory, *names):
+        for n in names:
+            (directory / n).write_bytes(b"\x00" * 512)
+
+    def test_scans_primary_images_only(self, tmp_path):
+        self._touch(
+            tmp_path,
+            "a.E01", "a.E02", "a.E03",   # one EWF set -> only a.E01
+            "b.dd",                       # raw
+            "c.001", "c.002",            # split raw -> only c.001
+            "notes.txt", "report.pdf",   # non-images ignored
+        )
+        names = {p.name for p in find_images_in_dir(tmp_path)}
+        assert names == {"a.E01", "b.dd", "c.001"}
+
+    def test_pattern_filter(self, tmp_path):
+        self._touch(tmp_path, "a.E01", "b.E01", "c.dd")
+        names = {p.name for p in find_images_in_dir(tmp_path, pattern="*.E01")}
+        assert names == {"a.E01", "b.E01"}
+
+    def test_recursive_scan(self, tmp_path):
+        sub = tmp_path / "case" / "host1"
+        sub.mkdir(parents=True)
+        self._touch(tmp_path, "top.E01")
+        self._touch(sub, "nested.dd")
+        flat = {p.name for p in find_images_in_dir(tmp_path)}
+        deep = {p.name for p in find_images_in_dir(tmp_path, recursive=True)}
+        assert flat == {"top.E01"}
+        assert deep == {"top.E01", "nested.dd"}
+
+    def test_skips_vmdk_extents(self, tmp_path):
+        self._touch(tmp_path, "vm.vmdk", "vm-s001.vmdk", "vm-s002.vmdk")
+        names = {p.name for p in find_images_in_dir(tmp_path)}
+        assert names == {"vm.vmdk"}
+
+    def test_is_primary_image(self, tmp_path):
+        img = tmp_path / "x.E01"
+        img.write_bytes(b"\x00")
+        seg = tmp_path / "x.E02"
+        seg.write_bytes(b"\x00")
+        assert is_primary_image(img) is True
+        assert is_primary_image(seg) is False
+        assert is_primary_image(tmp_path / "missing.E01") is False
+
+    def test_sparsebundle_directory_is_an_image(self, tmp_path):
+        # A macOS .sparsebundle is a *directory* the handler reassembles.
+        bundle = tmp_path / "backup.sparsebundle"
+        (bundle / "bands").mkdir(parents=True)
+        (bundle / "Info.plist").write_text("<plist/>")
+        self._touch(tmp_path, "other.dd")
+
+        assert is_bundle_image(bundle) is True
+        assert is_primary_image(bundle) is True
+        names = {p.name for p in find_images_in_dir(tmp_path)}
+        assert names == {"backup.sparsebundle", "other.dd"}
+
+    def test_plain_directory_is_not_a_bundle_image(self, tmp_path):
+        plain = tmp_path / "evidence"
+        plain.mkdir()
+        assert is_bundle_image(plain) is False
+        assert is_primary_image(plain) is False

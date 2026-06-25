@@ -452,22 +452,98 @@ def build_apfs_fuse(force: bool = False) -> bool:
     return False
 
 
-def installed_ewfmount_version() -> Optional[str]:
-    """Return the installed ``ewfmount`` version (``YYYYMMDD``) or None.
+def ewfmount_version_of(binary: str) -> Optional[str]:
+    """Return the ``YYYYMMDD`` version reported by a specific ewfmount binary.
 
     libewf tools print ``ewfmount YYYYMMDD`` as the first line of ``-V`` output
-    (to stdout, though we read stderr too defensively).
+    (to stdout, though we read stderr too defensively).  Returns None when the
+    binary is missing or doesn't report a parseable version.
     """
-    if not tool_exists("ewfmount"):
-        return None
     try:
         result = subprocess.run(
-            ["ewfmount", "-V"], capture_output=True, text=True, timeout=10,
+            [binary, "-V"], capture_output=True, text=True, timeout=10,
         )
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         return None
-    match = re.search(r"ewfmount\s+(\d{8})", (result.stdout or "") + (result.stderr or ""))
+    match = re.search(
+        r"ewfmount\s+(\d{8})", (result.stdout or "") + (result.stderr or ""),
+    )
     return match.group(1) if match else None
+
+
+# Locations a source-built (modern) ewfmount typically lands in, plus the apt
+# one.  Scanned in addition to PATH so MountIR finds a newer build even when the
+# caller's PATH (or sudo's ``secure_path``) would resolve the legacy one first.
+_EWFMOUNT_CANDIDATE_DIRS = ["/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin"]
+
+
+def _candidate_ewfmount_paths() -> List[str]:
+    """All distinct ewfmount binaries on PATH and in the known install dirs.
+
+    ``shutil.which`` only returns the *first* hit on PATH; under ``sudo`` the
+    reset ``secure_path`` can put the frozen apt build (/usr/bin) ahead of a
+    source-built modern one (/usr/local/bin).  We gather every candidate so the
+    newest can be chosen explicitly rather than relying on PATH ordering.
+    """
+    seen: Dict[str, None] = {}
+    paths: List[str] = []
+
+    def _add(p: Optional[str]) -> None:
+        if not p:
+            return
+        try:
+            real = str(Path(p).resolve())
+        except OSError:
+            real = p
+        if real not in seen and Path(p).exists():
+            seen[real] = None
+            paths.append(p)
+
+    import shutil
+    _add(shutil.which("ewfmount"))
+    for d in _EWFMOUNT_CANDIDATE_DIRS:
+        _add(str(Path(d) / "ewfmount"))
+    return paths
+
+
+def best_ewfmount(minimum: str = LIBEWF_VERSION) -> Optional[str]:
+    """Path to the newest ewfmount available, preferring an EWF2-capable build.
+
+    Scans every ewfmount on PATH and in the standard install dirs, reads each
+    one's version, and returns the highest.  This guarantees MountIR uses a
+    modern (Ex01/Lx01-capable) ewfmount when one is installed, regardless of how
+    PATH or ``sudo``'s ``secure_path`` is ordered.  Returns None when no
+    ewfmount is found at all.
+    """
+    best_path: Optional[str] = None
+    best_ver = -1
+    for path in _candidate_ewfmount_paths():
+        ver = ewfmount_version_of(path)
+        try:
+            ver_int = int(ver) if ver else 0
+        except ValueError:
+            ver_int = 0
+        if ver_int > best_ver:
+            best_ver, best_path = ver_int, path
+    # Fall back to a bare "ewfmount" (resolved via PATH at exec time) only when
+    # nothing concrete was found but the name is on PATH.
+    if best_path is None and tool_exists("ewfmount"):
+        return "ewfmount"
+    return best_path
+
+
+def installed_ewfmount_version() -> Optional[str]:
+    """Return the version of the *newest* ewfmount available (``YYYYMMDD``).
+
+    Considers every candidate (not just the first on PATH) so the reported
+    version reflects the build MountIR will actually use to mount.
+    """
+    best_ver: Optional[str] = None
+    for path in _candidate_ewfmount_paths():
+        ver = ewfmount_version_of(path)
+        if ver and (best_ver is None or int(ver) > int(best_ver)):
+            best_ver = ver
+    return best_ver
 
 
 def have_modern_libewf(minimum: str = LIBEWF_VERSION) -> bool:

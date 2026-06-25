@@ -175,3 +175,46 @@ class TestHandlerProperties:
     ])
     def test_required_tools(self, handler, tools):
         assert handler.required_tools == tools
+
+
+class TestEwfBinaryResolution:
+    """EWF handler invokes the newest ewfmount, not just PATH's first hit."""
+
+    def test_mount_uses_best_ewfmount(self, tmp_path):
+        from pathlib import Path
+
+        image = tmp_path / "evidence.Ex01"
+        image.write_bytes(b"\x00")
+        mp = tmp_path / "container"
+        mp.mkdir()
+        (mp / "ewf1").write_bytes(b"\x00")  # ewfmount's raw output stand-in
+
+        with patch("handlers.ewf.bootstrap.best_ewfmount",
+                   return_value="/usr/local/bin/ewfmount"), \
+             patch("handlers.ewf.bootstrap.have_modern_libewf", return_value=True), \
+             patch("handlers.ewf.run_command") as rc:
+            result = EwfHandler().mount(image, mp)
+
+        assert result.success is True
+        # The resolved (modern) binary is what actually runs.
+        assert rc.call_args.args[0][0] == "/usr/local/bin/ewfmount"
+
+    def test_ex01_with_legacy_build_warns(self, tmp_path, caplog):
+        import logging
+
+        image = tmp_path / "evidence.ex01"
+        image.write_bytes(b"\x00")
+        mp = tmp_path / "container"
+        mp.mkdir()
+        (mp / "ewf1").write_bytes(b"\x00")
+
+        with patch("handlers.ewf.bootstrap.best_ewfmount",
+                   return_value="/usr/bin/ewfmount"), \
+             patch("handlers.ewf.bootstrap.have_modern_libewf", return_value=False), \
+             patch("handlers.ewf.bootstrap.ewfmount_version_of", return_value="20140807"), \
+             patch("handlers.ewf.run_command"), \
+             caplog.at_level(logging.WARNING, logger="MountIR"):
+            EwfHandler().mount(image, mp)
+
+        assert any("legacy" in r.message.lower() or "EWF2" in r.message
+                   for r in caplog.records)

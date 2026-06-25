@@ -69,6 +69,12 @@ outside the core IR set above; tool availability varies by distro.
 
 - **Read-only by default** — forensic mount flags `ro,noatime,noexec,norecovery`
   applied per filesystem.
+- **Batch / directory mounting** — point MountIR at several images, shell globs,
+  or a whole folder and it mounts each one (skipping continuation segments and
+  VMDK extents so multi-part sets mount once).
+- **Best-effort `--force` mode** — survives corrupt/absent partition tables and
+  brute-forces the filesystem type regardless of OS, the scaffold for edge
+  devices, odd appliances, and unfamiliar disk types.
 - **Automatic format detection** via extension + `file(1)` magic.
 - **Robust filesystem detection** — probes each partition with `blkid -p`
   (low-level, works on freshly-attached loop devices), falling back to `lsblk`
@@ -272,8 +278,18 @@ sudo MOUNTIR_LIBEWF_VERSION=20240506 mountir setup --force
 > behaviour or fail to build. The pin is the tested default — only override it
 > if you specifically need another version.
 
-`mountir check` reports the installed `ewfmount` version and whether it can read
-Ex01/Lx01.
+`mountir check` reports the `ewfmount` version, whether it can read Ex01/Lx01,
+and the **exact binary path** MountIR will invoke.
+
+> **MountIR always uses the newest `ewfmount` it can find.** A source-built
+> modern `ewfmount` lands in `/usr/local/bin` alongside the frozen apt build in
+> `/usr/bin`. Because `sudo` resets `PATH` to its `secure_path`, the legacy
+> `/usr/bin` build can end up first on `PATH` and silently fail to open an
+> Ex01/Lx01 image. To avoid that, MountIR scans every `ewfmount` on the system,
+> picks the highest version, and invokes it by full path — so EWF2 images mount
+> with the modern build regardless of `PATH`/`secure_path` ordering. When you
+> hand it an Ex01/Lx01 image but only a legacy build is present, it warns up
+> front with the fix (`mountir setup`) instead of failing opaquely.
 
 ---
 
@@ -290,22 +306,66 @@ sudo mountir <command> ...                    # if symlinked onto PATH
 ### Mount a forensic disk image
 
 ```bash
-sudo mountir mount <image-path> \
-  [--mount-base DIR] [--case-id ID] [--no-partitions] \
+sudo mountir mount <image|dir|glob> [<more> ...] \
+  [-d|--mount-base DIR] [-r|--recursive] [--pattern GLOB] [--force] \
+  [--case-id ID] [--no-partitions] \
   [--json-input FILE] [--maelstrom] [--maelstrom-profiles PROFILE ...] \
   [-v] [--json]
 ```
 
+The positional argument accepts **one or more** images, shell globs, and/or
+**directories**. A directory is scanned for every recognised image inside it, so
+a whole evidence folder mounts in one command (continuation segments such as
+`.E02`/`.002` and VMDK split extents are skipped so a multi-part set mounts once,
+from its first file). Each image is mounted independently under its own
+`<mount-base>/<mount-id>` tree; a failure on one image is logged and the rest
+still mount.
+
 | Option | Description |
 | --- | --- |
-| `--mount-base DIR` | Base directory for mount points (default `/mnt/mountir`) |
+| `-d`, `--mount-base`, `--dir DIR` | Base directory for mount points (default `/mnt/mountir`) |
+| `-r`, `--recursive` | When a directory is given, scan it **recursively** for images |
+| `--pattern GLOB` | When scanning a directory, only mount files matching this glob (e.g. `'*.E01'`) |
+| `--force`, `--best-effort` | **Mount anyway**: survive a corrupt/absent partition table and brute-force the filesystem type regardless of OS (see [Best-effort mounting](#best-effort-mounting----force)) |
 | `--case-id ID` | Case identifier, used in mount-point naming |
 | `--no-partitions` | Mount the container only; skip partition detection |
 | `--json-input FILE` | Read the mount request from a JSON file (`-` = stdin) |
 | `--maelstrom` | Run Maelstrom on mounted filesystems after mounting |
 | `--maelstrom-profiles ...` | Profiles to pass to Maelstrom |
 | `-v`, `--verbose` | Verbose logging |
-| `--json` | Emit machine-readable JSON to stdout |
+| `--json` | Emit machine-readable JSON to stdout (a single image emits one object; several emit `{"mounts": [...]}`) |
+
+```bash
+# A single image
+sudo mountir mount /evidence/laptop.E01
+
+# Every image in a folder (recursively), into a custom base dir
+sudo mountir mount /evidence/case42/ -r -d /mnt/case42
+
+# Only the EnCase sets in a folder
+sudo mountir mount /evidence/ --pattern '*.E01'
+
+# Several images at once
+sudo mountir mount /evidence/a.Ex01 /evidence/b.vmdk /evidence/c.dd
+```
+
+#### Best-effort mounting (`--force`)
+
+`--force` (alias `--best-effort`) is for **damaged, exotic, or unknown** media —
+edge devices, odd appliances, corrupt acquisitions:
+
+- A **corrupt or missing partition table** no longer aborts the image: the whole
+  disk is exposed as a single read-only loop device so it can be mounted or
+  carved.
+- The filesystem type is **brute-forced regardless of OS** — every known driver
+  (NTFS, ext, XFS, Btrfs, exFAT/FAT, HFS+, UFS, APFS/VMFS via FUSE) is tried
+  read-only, plus dirty-volume flags for journaled volumes that weren't cleanly
+  unmounted.
+- Anything that still can't be mounted has its **raw block device reported** in
+  the summary so you can image or carve it directly.
+
+All `--force` mounts remain strictly **read-only**; it widens *what* MountIR will
+attempt, never *how* it touches the evidence.
 
 ### Unmount a mounted image
 
@@ -317,14 +377,19 @@ sudo mountir unmount --all                      # unmount everything
 ### List mounted images
 
 ```bash
-mountir list [-v] [--json]
+mountir list [-d|--mount-base DIR] [-v] [--json]
 ```
+
+By default `list` shows every tracked mount. Pass `-d DIR` to show only the
+images mounted under that base directory (matching how you mounted them with
+`mount -d DIR`).
 
 ### Clean up orphaned mounts
 
 ```bash
-sudo mountir clean                    # release & remove everything under /mnt/mountir
-sudo mountir clean --mount-base DIR   # clean a custom base
+sudo mountir clean                       # release & remove everything under /mnt/mountir
+sudo mountir clean -d /mnt/case42        # clean a custom base
+sudo mountir clean --mount-base DIR      # (long form of -d)
 ```
 
 Unmounts anything still mounted under the base (deepest-first, with a lazy
