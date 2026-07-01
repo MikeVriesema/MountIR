@@ -805,7 +805,8 @@ def cmd_check(args):
         ("exFAT", "mount.exfat-fuse", "exfat-fuse", "exFAT (kernel 5.4+ also works)"),
         ("HFS+", "fsck.hfsplus", "hfsprogs", "macOS legacy volumes"),
         ("APFS", "apfs-fuse", "built from source: mountir setup", "macOS APFS volumes"),
-        ("VMFS", "vmfs-fuse", "vmfs-tools", "VMware ESXi datastores"),
+        ("VMFS3/5", "vmfs-fuse", "vmfs-tools", "VMware ESXi 5.x datastores"),
+        ("VMFS6", "vmfs6-fuse", "vmfs6-tools", "VMware ESXi 6.5+ datastores"),
         ("ZFS", "zpool", "zfsutils-linux", "ZFS pools (also needs kernel module)"),
         ("UFS", None, "kernel driver", "FreeBSD/NetScaler/pfSense"),
     ]

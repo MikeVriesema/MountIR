@@ -390,6 +390,41 @@ class TestFuseMounters:
         assert _fuse_mount_commands("ntfs", "/dev/loop3", Path("/mnt/x")) == []
 
 
+class TestMountPartitionErrorSelection:
+    """Reported mount error reflects the detected type, not the force-mode
+    sweep over unrelated FUSE drivers."""
+
+    @staticmethod
+    def _fake_run(cmd, **kw):
+        import subprocess
+        if cmd and cmd[0] in ("apfs-fuse", "vmfs-fuse", "vmfs6-fuse"):
+            raise FileNotFoundError(cmd[0])          # FUSE binaries "missing"
+        raise subprocess.CalledProcessError(         # standard mount fails
+            32, cmd, stderr="mount: bad superblock on /dev/loop2")
+
+    def test_non_fuse_type_reports_standard_error(self, tmp_path):
+        # An unknown-type partition in force mode sweeps every FUSE driver; a
+        # missing swept driver must NOT mask the real "bad superblock" error.
+        part = PartitionInfo(device="/dev/loop2", number=1, filesystem="")
+        with patch("partition.run_command", side_effect=self._fake_run), \
+             patch("partition.ensure_mount_dir"):
+            result = mount_partition(part, tmp_path / "p1", force=True)
+        assert result.mounted is False
+        assert "superblock" in result.mount_error
+        assert "vmfs6-fuse" not in result.mount_error
+
+    def test_vmfs_type_reports_its_own_driver(self, tmp_path):
+        # For a genuinely-VMFS partition the actionable error is a vmfs driver,
+        # never the swept apfs-fuse.
+        part = PartitionInfo(device="/dev/loop2", number=1, filesystem="vmfs")
+        with patch("partition.run_command", side_effect=self._fake_run), \
+             patch("partition.ensure_mount_dir"):
+            result = mount_partition(part, tmp_path / "p1", force=True)
+        assert result.mounted is False
+        assert "vmfs" in result.mount_error
+        assert "apfs" not in result.mount_error
+
+
 class TestMountPartitionDispatch:
     """mount_partition chooses FUSE binaries vs `mount`, and skips pseudo-FS."""
 

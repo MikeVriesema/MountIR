@@ -772,18 +772,24 @@ def mount_partition(partition: PartitionInfo, mount_point: Path,
     fuse_error = ""  # FUSE-binary failure: the actionable message for APFS/VMFS
 
     # 1. Dedicated FUSE binaries (APFS/VMFS) have no kernel/`mount -t` driver,
-    #    so try them first when the detected type calls for one.
+    #    so try them first when the detected type calls for one. Only the
+    #    detected type's own drivers set the reported error; in force mode the
+    #    sweep also tries unrelated FUSE drivers, whose failures are just noise.
+    primary_fuse = {b for b, _ in _FUSE_MOUNTERS.get(partition.filesystem, [])}
     for cmd in _fuse_mount_commands(partition.filesystem, partition.device,
                                     mount_point, force=force):
         try:
             run_command(cmd, capture=True)
         except FileNotFoundError:
-            fuse_error = f"{cmd[0]} not installed"
+            if cmd[0] in primary_fuse:
+                fuse_error = f"{cmd[0]} not installed"
             logger.debug("FUSE mounter missing: %s", cmd[0])
             continue
         except Exception as e:
-            fuse_error = _short_mount_error(e)
-            logger.debug("FUSE mount attempt failed (%s): %s", cmd[0], fuse_error)
+            if cmd[0] in primary_fuse:
+                fuse_error = _short_mount_error(e)
+            logger.debug("FUSE mount attempt failed (%s): %s", cmd[0],
+                         _short_mount_error(e))
             continue
 
         partition.mount_point = mount_point
@@ -822,9 +828,11 @@ def mount_partition(partition: PartitionInfo, mount_point: Path,
         )
         return partition
 
-    # When a dedicated FUSE driver exists for this type, its failure is the
-    # actionable one (e.g. "apfs-fuse not installed") -- the generic mount
-    # "unknown filesystem type" only restates that the kernel can't help.
+    # The actionable error: the detected type's own FUSE driver failure when it
+    # has one (e.g. "vmfs6-fuse not installed"); otherwise the standard-mount
+    # error ("bad superblock", ...). fuse_error is only set for the detected
+    # type -- not the force-mode sweep of unrelated drivers -- so an irrelevant
+    # swept driver can no longer mask the real failure.
     partition.mount_error = fuse_error or last_error
     logger.warning("Failed to mount %s: %s", partition.device, partition.mount_error)
     return partition

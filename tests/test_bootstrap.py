@@ -14,13 +14,55 @@ class TestSystemPackages:
 
     @pytest.mark.parametrize("tool,package", [
         ("zpool", "zfsutils-linux"),       # ZFS pools
-        ("vmfs-fuse", "vmfs-tools"),       # VMware VMFS5
+        ("vmfs-fuse", "vmfs-tools"),       # VMware VMFS3/5
+        ("vmfs6-fuse", "vmfs6-tools"),     # VMware VMFS6
         ("mount.exfat-fuse", "exfat-fuse"),  # exFAT FUSE fallback
         ("fsck.exfat", "exfatprogs"),      # exFAT userland
         ("fsck.hfsplus", "hfsprogs"),      # macOS HFS+
     ])
     def test_driver_tool_mapped(self, tool, package):
         assert bootstrap.SYSTEM_PACKAGES.get(tool) == package
+
+
+class TestInstallSystemDepsFallback:
+    """A failed batch install retries packages individually, so one package
+    that's unavailable on this distro (e.g. vmfs6-tools) doesn't block the rest."""
+
+    @staticmethod
+    def _proc(rc):
+        m = MagicMock()
+        m.returncode = rc
+        return m
+
+    def test_individual_retry_succeeds(self):
+        seen = []
+
+        def fake_run(cmd, **kw):
+            seen.append(cmd)
+            if "install" not in cmd:            # apt-get update
+                return self._proc(0)
+            pkgs = cmd[cmd.index("-y") + 1:]
+            return self._proc(0 if len(pkgs) == 1 else 100)  # batch fails, singles ok
+
+        with patch("bootstrap.is_root", return_value=True), \
+             patch("bootstrap.subprocess.run", side_effect=fake_run):
+            assert bootstrap.install_system_deps(["a", "b"]) is True
+        singles = [c[c.index("-y") + 1:] for c in seen
+                   if "install" in c and len(c[c.index("-y") + 1:]) == 1]
+        assert ["a"] in singles and ["b"] in singles
+
+    def test_reports_failure_for_unavailable_package(self):
+        def fake_run(cmd, **kw):
+            if "install" not in cmd:
+                return self._proc(0)
+            pkgs = cmd[cmd.index("-y") + 1:]
+            if len(pkgs) == 1:
+                return self._proc(0 if pkgs == ["a"] else 100)  # 'b' unavailable
+            return self._proc(100)                               # batch fails
+
+        with patch("bootstrap.is_root", return_value=True), \
+             patch("bootstrap.subprocess.run", side_effect=fake_run):
+            assert bootstrap.install_system_deps(["a", "b"]) is False
 
     def test_missing_packages_dedup_and_map(self):
         # Only zpool is absent -> exactly its package is reported.

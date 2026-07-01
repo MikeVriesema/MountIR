@@ -65,7 +65,8 @@ SYSTEM_PACKAGES: Dict[str, str] = {
     "mount.exfat-fuse": "exfat-fuse",  # exFAT FUSE fallback (kernel handles 5.4+)
     "fsck.exfat": "exfatprogs",        # exFAT userland (label/fsck)
     "fsck.hfsplus": "hfsprogs",        # macOS HFS+ fsck/label helpers
-    "vmfs-fuse": "vmfs-tools",         # VMware ESXi VMFS5 datastores
+    "vmfs-fuse": "vmfs-tools",         # VMware ESXi VMFS3/5 datastores
+    "vmfs6-fuse": "vmfs6-tools",        # VMware ESXi 6.5+ VMFS6 datastores
     "zpool": "zfsutils-linux",         # ZFS pool import (also needs kernel module)
     # UFS (FreeBSD/NetScaler/pfSense) uses the in-kernel ufs driver - no package.
     # APFS (apfs-fuse) is not in apt; it is built from source (see build_apfs_fuse).
@@ -384,8 +385,23 @@ def install_system_deps(packages: List[str]) -> bool:
         if result.returncode == 0:
             logger.info("System packages installed successfully")
             return True
-        logger.warning("Some packages may have failed to install")
-        return False
+        # The batch failed -- often a single package is unavailable on this
+        # distro (e.g. vmfs6-tools isn't in every apt repo). Retry each package
+        # individually so one missing package doesn't block all the others.
+        logger.warning(
+            "Batch install failed; retrying packages individually "
+            "(some may be unavailable on this distro)")
+        failed = []
+        for pkg in packages:
+            r = subprocess.run(prefix + ["apt-get", "install", "-y", pkg],
+                               text=True, timeout=300)
+            if r.returncode != 0:
+                failed.append(pkg)
+        if failed:
+            logger.warning("Could not install: %s", " ".join(failed))
+            return False
+        logger.info("System packages installed successfully (individually)")
+        return True
     except FileNotFoundError:
         logger.error(
             "apt-get not found. MountIR auto-install targets Debian/Ubuntu. "
