@@ -825,6 +825,7 @@ def cmd_check(args):
             )
         output["ewfmount_version"] = bootstrap.installed_ewfmount_version()
         output["ewfmount_modern"] = bootstrap.have_modern_libewf()
+        output["ewfmount_fuse"] = bootstrap.ewfmount_has_fuse()
         output["ewfmount_path"] = bootstrap.best_ewfmount()
         print(json.dumps(output, indent=2))
         return
@@ -855,14 +856,21 @@ def cmd_check(args):
     ewf_ver = bootstrap.installed_ewfmount_version()
     ewf_path = bootstrap.best_ewfmount()
     if ewf_ver:
-        if bootstrap.have_modern_libewf():
-            note = _ok(f"v{ewf_ver}: modern, Ex01/Lx01 supported")
+        modern = bootstrap.have_modern_libewf()
+        has_fuse = bootstrap.ewfmount_has_fuse()
+        if modern and has_fuse:
+            note = _ok(f"v{ewf_ver}: modern + FUSE, Ex01/Lx01 mountable")
+        elif modern and not has_fuse:
+            note = _miss(f"v{ewf_ver}: modern but NO FUSE - cannot mount")
         else:
             note = _miss(f"v{ewf_ver}: legacy, no Ex01/Lx01")
         print(f"  {'':14} {note}", file=sys.stderr)
         if ewf_path:
             print(f"  {'':14} Using: {ewf_path}", file=sys.stderr)
-        if not bootstrap.have_modern_libewf():
+        if modern and not has_fuse:
+            print(f"  {'':14} Rebuild with FUSE: mountir setup --force",
+                  file=sys.stderr)
+        elif not modern:
             print(f"  {'':14} Build modern libewf: mountir setup",
                   file=sys.stderr)
 

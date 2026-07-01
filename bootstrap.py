@@ -594,6 +594,57 @@ def _extract_tarball(tarball: Path, dest: Path) -> Optional[Path]:
     return dest / next(iter(tops)) if len(tops) == 1 else dest
 
 
+def ewfmount_has_fuse(binary: Optional[str] = None) -> bool:
+    """True when *binary* (default: the resolved ewfmount) links a FUSE library.
+
+    A libewf build without FUSE produces an ewfmount that reports a modern
+    version but fails every mount with "No sub system to mount EWF format", so a
+    version check alone is not enough. Inspecting the dynamic dependencies is a
+    cheap, reliable capability probe.
+    """
+    binary = binary or best_ewfmount() or "ewfmount"
+    try:
+        result = subprocess.run(
+            ["ldd", binary], capture_output=True, text=True, timeout=15,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return False
+    return "libfuse" in (result.stdout or "").lower()
+
+
+def _make_fuse2_pkgconfig_wrapper() -> Optional[str]:
+    """Create a pkg-config shim that hides fuse3 so libewf builds against fuse2.
+
+    libewf 20240506's configure prefers fuse3 and reports success with it, but
+    the resulting ewfmount links no FUSE subsystem and cannot mount. The fuse2
+    path works. This shim makes any ``fuse3`` pkg-config query fail while passing
+    everything else through to the real pkg-config, so configure falls back to
+    fuse2 -- without uninstalling the system's libfuse3-dev. Returns the shim
+    path, or None when pkg-config isn't available.
+    """
+    import shutil
+    real = shutil.which("pkg-config")
+    if not real:
+        return None
+    wrapper = _SOURCE_BUILD_ROOT / "pkgconfig-no-fuse3.sh"
+    try:
+        _SOURCE_BUILD_ROOT.mkdir(parents=True, exist_ok=True)
+        script = (
+            "#!/bin/sh\n"
+            "# MountIR: hide fuse3 so libewf builds against the reliable fuse2.\n"
+            'for arg in "$@"; do\n'
+            '  case "$arg" in *fuse3*) exit 1 ;; esac\n'
+            "done\n"
+            f'exec "{real}" "$@"\n'
+        )
+        wrapper.write_text(script, encoding="utf-8")
+        wrapper.chmod(0o755)
+    except OSError as e:
+        logger.debug("could not create pkg-config fuse2 shim: %s", e)
+        return None
+    return str(wrapper)
+
+
 def build_libewf(force: bool = False, version: str = "") -> bool:
     """Build and install modern libewf from source for EWF2 (Ex01/Lx01) support.
 
@@ -610,8 +661,8 @@ def build_libewf(force: bool = False, version: str = "") -> bool:
     ``mountir setup --force`` to pull a newer pinned/override version).
     """
     version = version or os.environ.get("MOUNTIR_LIBEWF_VERSION") or LIBEWF_VERSION
-    if not force and have_modern_libewf():
-        logger.debug("modern libewf already installed (Ex01/Lx01 supported)")
+    if not force and have_modern_libewf() and ewfmount_has_fuse():
+        logger.debug("modern, FUSE-capable libewf already installed")
         return True
 
     url = LIBEWF_RELEASE_URL.format(version=version)
@@ -632,15 +683,29 @@ def build_libewf(force: bool = False, version: str = "") -> bool:
         return False
 
     tarball = _SOURCE_BUILD_ROOT / f"libewf-{version}.tar.gz"
+    src_dir = _SOURCE_BUILD_ROOT / f"libewf-{version}"
     try:
         _SOURCE_BUILD_ROOT.mkdir(parents=True, exist_ok=True)
         if not _download(url, tarball):
             logger.warning("Could not download libewf source from %s", url)
             return False
+        # Always build from a pristine tree. Rebuilding over stale objects (e.g.
+        # after installing FUSE headers) silently keeps the previous, possibly
+        # mount-incapable, ewfmount instead of recompiling against the new deps.
+        if src_dir.exists():
+            import shutil
+            shutil.rmtree(src_dir, ignore_errors=True)
         src = _extract_tarball(tarball, _SOURCE_BUILD_ROOT)
         if src is None:
             return False
-        if not _run(["./configure"], cwd=src, timeout=600):
+        # Force the reliable fuse2 build path: libewf 20240506 auto-detects
+        # fuse3 and reports success, but the ewfmount it produces links no FUSE
+        # subsystem and fails every mount ("No sub system to mount EWF format").
+        configure_cmd = ["./configure"]
+        pc_wrapper = _make_fuse2_pkgconfig_wrapper()
+        if pc_wrapper:
+            configure_cmd.append("PKG_CONFIG=" + pc_wrapper)
+        if not _run(configure_cmd, cwd=src, timeout=600):
             return False
         if not _run(["make", "-j"], cwd=src, timeout=1800):
             return False
@@ -651,11 +716,23 @@ def build_libewf(force: bool = False, version: str = "") -> bool:
         logger.warning("libewf build failed: %s", e)
         return False
 
-    if have_modern_libewf(version):
-        logger.info("libewf %s installed to /usr/local (Ex01/Lx01 enabled)", version)
-        return True
-    logger.warning("libewf build finished but a modern ewfmount isn't on PATH")
-    return False
+    # A version check alone isn't enough: verify the built ewfmount can actually
+    # mount (links a FUSE library), or the tool would report success over a
+    # binary that fails every mount.
+    if not have_modern_libewf(version):
+        logger.warning("libewf build finished but a modern ewfmount isn't on PATH")
+        return False
+    if not ewfmount_has_fuse():
+        logger.error(
+            "Built ewfmount (%s) has no FUSE support and cannot mount images. "
+            "Install FUSE headers and rebuild: 'sudo apt-get install libfuse-dev' "
+            "then 'sudo mountir setup --force'.",
+            best_ewfmount() or "ewfmount",
+        )
+        return False
+    logger.info(
+        "libewf %s installed to /usr/local (Ex01/Lx01, FUSE-capable)", version)
+    return True
 
 
 # ---------------------------------------------------------------------------

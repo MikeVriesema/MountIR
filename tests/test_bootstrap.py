@@ -216,9 +216,22 @@ class TestBuildLibewf:
 
     def test_skips_when_modern_present(self):
         with patch("bootstrap.have_modern_libewf", return_value=True), \
+             patch("bootstrap.ewfmount_has_fuse", return_value=True), \
              patch("bootstrap.install_system_deps") as deps:
             assert bootstrap.build_libewf() is True
         deps.assert_not_called()
+
+    def test_rebuilds_when_modern_but_no_fuse(self, tmp_path):
+        # A modern but FUSE-less ewfmount can't mount, so a plain (no-force)
+        # build must NOT short-circuit -- it must proceed to rebuild (auto-heal).
+        with patch("bootstrap._SOURCE_BUILD_ROOT", tmp_path / "src"), \
+             patch("bootstrap.have_modern_libewf", return_value=True), \
+             patch("bootstrap.ewfmount_has_fuse", return_value=False), \
+             patch("bootstrap._priv_prefix", return_value=[]), \
+             patch("bootstrap.install_system_deps", return_value=True) as deps, \
+             patch("bootstrap._download", return_value=False):
+            bootstrap.build_libewf()  # no force
+        deps.assert_called()  # did not skip; proceeded toward a rebuild
 
     def test_fails_without_privilege(self):
         with patch("bootstrap.have_modern_libewf", return_value=False), \
@@ -248,8 +261,11 @@ class TestBuildLibewf:
     def test_happy_path_downloads_configures_installs(self, tmp_path):
         src = tmp_path / "libewf-20240506"
         # have_modern_libewf: top check skipped by force; final check True.
+        # ewfmount_has_fuse True so the post-build FUSE verification passes.
         with patch("bootstrap._SOURCE_BUILD_ROOT", tmp_path / "src"), \
              patch("bootstrap.have_modern_libewf", return_value=True), \
+             patch("bootstrap.ewfmount_has_fuse", return_value=True), \
+             patch("bootstrap._make_fuse2_pkgconfig_wrapper", return_value=None), \
              patch("bootstrap._priv_prefix", return_value=[]), \
              patch("bootstrap.install_system_deps", return_value=True), \
              patch("bootstrap._download", return_value=True) as dl, \
@@ -264,6 +280,39 @@ class TestBuildLibewf:
         assert ["make", "-j"] in cmds
         assert ["make", "install"] in cmds
         assert ["ldconfig"] in cmds
+
+    def test_forces_fuse2_via_pkgconfig_wrapper(self, tmp_path):
+        # When a pkg-config shim is available, configure is told to use it so
+        # libewf builds against the reliable fuse2 path.
+        src = tmp_path / "libewf-20240506"
+        with patch("bootstrap._SOURCE_BUILD_ROOT", tmp_path / "src"), \
+             patch("bootstrap.have_modern_libewf", return_value=True), \
+             patch("bootstrap.ewfmount_has_fuse", return_value=True), \
+             patch("bootstrap._make_fuse2_pkgconfig_wrapper",
+                   return_value="/tmp/pc-shim"), \
+             patch("bootstrap._priv_prefix", return_value=[]), \
+             patch("bootstrap.install_system_deps", return_value=True), \
+             patch("bootstrap._download", return_value=True), \
+             patch("bootstrap._extract_tarball", return_value=src), \
+             patch("bootstrap._run", return_value=True) as run:
+            assert bootstrap.build_libewf(force=True) is True
+        cmds = [c.args[0] for c in run.call_args_list]
+        assert ["./configure", "PKG_CONFIG=/tmp/pc-shim"] in cmds
+
+    def test_fails_when_built_ewfmount_lacks_fuse(self, tmp_path):
+        # Build "succeeds" but the binary has no FUSE -> must report failure with
+        # a remedy, not claim success over a mount-incapable ewfmount.
+        src = tmp_path / "libewf-20240506"
+        with patch("bootstrap._SOURCE_BUILD_ROOT", tmp_path / "src"), \
+             patch("bootstrap.have_modern_libewf", return_value=True), \
+             patch("bootstrap.ewfmount_has_fuse", return_value=False), \
+             patch("bootstrap._make_fuse2_pkgconfig_wrapper", return_value=None), \
+             patch("bootstrap._priv_prefix", return_value=[]), \
+             patch("bootstrap.install_system_deps", return_value=True), \
+             patch("bootstrap._download", return_value=True), \
+             patch("bootstrap._extract_tarball", return_value=src), \
+             patch("bootstrap._run", return_value=True):
+            assert bootstrap.build_libewf(force=True) is False
 
     def test_build_completes_but_not_modern(self, tmp_path):
         src = tmp_path / "libewf-20240506"
@@ -301,3 +350,40 @@ class TestBuildLibewf:
              patch("bootstrap._run", return_value=True):
             bootstrap.build_libewf(force=True, version="20231119")
         assert "20231119" in dl.call_args.args[0]
+
+
+class TestEwfmountFuse:
+    """FUSE capability probe + the fuse2-forcing pkg-config shim."""
+
+    def test_has_fuse_true_when_libfuse_linked(self):
+        from unittest.mock import MagicMock
+        res = MagicMock(stdout="\tlibfuse.so.2 => /lib/x86_64-linux-gnu/libfuse.so.2\n")
+        with patch("bootstrap.subprocess.run", return_value=res), \
+             patch("bootstrap.best_ewfmount", return_value="/usr/local/bin/ewfmount"):
+            assert bootstrap.ewfmount_has_fuse() is True
+
+    def test_has_fuse_false_when_no_libfuse(self):
+        from unittest.mock import MagicMock
+        res = MagicMock(stdout="\tlibc.so.6 => /lib/x86_64-linux-gnu/libc.so.6\n")
+        with patch("bootstrap.subprocess.run", return_value=res), \
+             patch("bootstrap.best_ewfmount", return_value="/usr/local/bin/ewfmount"):
+            assert bootstrap.ewfmount_has_fuse() is False
+
+    def test_has_fuse_false_when_ldd_missing(self):
+        with patch("bootstrap.subprocess.run", side_effect=FileNotFoundError), \
+             patch("bootstrap.best_ewfmount", return_value="ewfmount"):
+            assert bootstrap.ewfmount_has_fuse() is False
+
+    def test_pkgconfig_shim_rejects_fuse3(self, tmp_path):
+        with patch("bootstrap._SOURCE_BUILD_ROOT", tmp_path), \
+             patch("shutil.which", return_value="/usr/bin/pkg-config"):
+            path = bootstrap._make_fuse2_pkgconfig_wrapper()
+        assert path is not None
+        content = (tmp_path / "pkgconfig-no-fuse3.sh").read_text(encoding="utf-8")
+        assert "fuse3" in content
+        assert "/usr/bin/pkg-config" in content
+
+    def test_pkgconfig_shim_none_without_pkgconfig(self, tmp_path):
+        with patch("bootstrap._SOURCE_BUILD_ROOT", tmp_path), \
+             patch("shutil.which", return_value=None):
+            assert bootstrap._make_fuse2_pkgconfig_wrapper() is None
