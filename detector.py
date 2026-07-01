@@ -66,6 +66,32 @@ _EXTENSION_MAP = {
     ".xva": ImageType.XVA,
 }
 
+# Display labels for the EWF sub-formats. The E01 and L01 ImageTypes each cover
+# both EWF v1 and EWF v2 (Ex01/Lx01) because ewfmount handles them identically;
+# this maps back to the specific container so logs/summaries show what the
+# analyst actually supplied.
+_EWF_DISPLAY_BY_EXT = {
+    ".e01": "E01",
+    ".ex01": "Ex01",
+    ".l01": "L01",
+    ".lx01": "Lx01",
+}
+
+
+def display_format(image_path: Path, image_type: ImageType) -> str:
+    """Human-facing label for the detected format.
+
+    E01/L01 cover both EWF v1 and v2 (Ex01/Lx01) under one handler; this surfaces
+    the specific container (Ex01/Lx01) from the file extension so the analyst sees
+    what they supplied. Every other format uses the ImageType name upper-cased.
+    """
+    if image_type in (ImageType.E01, ImageType.L01):
+        label = _EWF_DISPLAY_BY_EXT.get(image_path.suffix.lower())
+        if label:
+            return label
+    return image_type.value.upper()
+
+
 # Multi-segment E01 extensions: .E02-.E99, .EAA-.EZZ
 # We recognise these so we can point the user to .E01
 _E01_SEGMENT_PATTERN = None  # compiled on first use

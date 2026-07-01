@@ -9,7 +9,28 @@ import pytest
 from detector import (
     ImageType, detect_image_type, find_images_in_dir, is_primary_image,
     is_bundle_image, _is_e01_segment, _is_secondary_segment, _EXTENSION_MAP,
+    display_format,
 )
+
+
+class TestDisplayFormat:
+    """Display label surfaces the specific EWF container (Ex01/Lx01)."""
+
+    @pytest.mark.parametrize("name,image_type,expected", [
+        ("evidence.E01", ImageType.E01, "E01"),
+        ("evidence.Ex01", ImageType.E01, "Ex01"),
+        ("evidence.L01", ImageType.L01, "L01"),
+        ("evidence.Lx01", ImageType.L01, "Lx01"),
+        # Non-EWF formats just use the ImageType name.
+        ("disk.raw", ImageType.RAW, "RAW"),
+        ("disk.vmdk", ImageType.VMDK, "VMDK"),
+    ])
+    def test_display_format(self, name, image_type, expected):
+        assert display_format(Path("/cases") / name, image_type) == expected
+
+    def test_ewf_type_with_unknown_extension_falls_back(self):
+        # e.g. an EWF image detected by magic without a recognised extension.
+        assert display_format(Path("/cases/image.bin"), ImageType.E01) == "E01"
 
 
 class TestExtensionMapping:

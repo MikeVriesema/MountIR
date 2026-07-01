@@ -33,7 +33,7 @@ from utils import (
 )
 from detector import (
     ImageType, detect_image_type, find_images_in_dir, is_bundle_image,
-    _is_secondary_segment, SUPPORTED_FORMATS,
+    _is_secondary_segment, SUPPORTED_FORMATS, display_format,
 )
 from handlers import get_handler, ALL_HANDLER_CLASSES, NO_PARTITION_TYPES
 from handlers.base import MountResult
@@ -150,7 +150,7 @@ def _mount_one_image(image_path: Path, args, state_mgr: StateManager):
         logger.error("Unrecognized image format: %s", image_path)
         logger.error("Supported formats: %s", SUPPORTED_FORMATS)
         return None
-    logger.info("Detected image type: %s (%s)", image_type.value.upper(), image_path.name)
+    logger.info("Detected image type: %s (%s)", display_format(image_path, image_type), image_path.name)
 
     # Get handler and check tools
     handler = get_handler(image_type)
@@ -231,7 +231,7 @@ def _mount_one_image(image_path: Path, args, state_mgr: StateManager):
     elif image_type in NO_PARTITION_TYPES:
         logger.info(
             "Skipping partition detection (%s has no partition table)",
-            image_type.value.upper(),
+            display_format(image_path, image_type),
         )
 
     # Save state
@@ -438,7 +438,7 @@ def _print_mount_summary(mount_id, image_path, image_type, result,
     print(_h("Mount Summary"), file=sys.stderr)
     print(_h("=" * 50), file=sys.stderr)
     print(f"  {'Image:':<18} {_v(image_path.name)}", file=sys.stderr)
-    print(f"  {'Type:':<18} {_v(image_type.value.upper())}", file=sys.stderr)
+    print(f"  {'Type:':<18} {_v(display_format(image_path, image_type))}", file=sys.stderr)
     os_hint = infer_os(partitions)
     if os_hint != "Unknown":
         print(f"  {'Likely OS:':<18} {_v(os_hint)}", file=sys.stderr)
