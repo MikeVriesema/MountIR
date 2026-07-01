@@ -218,3 +218,69 @@ class TestEwfBinaryResolution:
 
         assert any("legacy" in r.message.lower() or "EWF2" in r.message
                    for r in caplog.records)
+
+
+class TestEwfLogicalVsPhysical:
+    """Logical (L01/Lx01) images mount with ``-f files``; physical don't."""
+
+    @pytest.mark.parametrize("ext", [".L01", ".Lx01"])
+    def test_logical_uses_files_format(self, tmp_path, ext):
+        """L01/Lx01 pass '-f files' and report the mount point as the file tree."""
+        image = tmp_path / f"evidence{ext}"
+        image.write_bytes(b"\x00")
+        mp = tmp_path / "container"
+        mp.mkdir()
+        # A '-f files' mount exposes a reconstructed tree, not an ewf1 device.
+        (mp / "Users").mkdir()
+
+        with patch("handlers.ewf.bootstrap.best_ewfmount",
+                   return_value="/usr/local/bin/ewfmount"), \
+             patch("handlers.ewf.bootstrap.have_modern_libewf", return_value=True), \
+             patch("handlers.ewf.run_command") as rc:
+            result = EwfHandler().mount(image, mp)
+
+        assert result.success is True
+        # No raw device for a logical mount -- the mount point is the tree.
+        assert result.raw_image_path is None
+        assert result.mount_point == mp
+        # ewfmount was invoked in files mode, before the positional args.
+        cmd = rc.call_args.args[0]
+        assert cmd[:3] == ["/usr/local/bin/ewfmount", "-f", "files"]
+        assert cmd[-2:] == [str(image), str(mp)]
+
+    def test_logical_empty_tree_is_failure(self, tmp_path):
+        """A logical mount that exposes nothing is reported as a failure."""
+        image = tmp_path / "evidence.Lx01"
+        image.write_bytes(b"\x00")
+        mp = tmp_path / "container"
+        mp.mkdir()  # left empty -- ewfmount produced no tree
+
+        with patch("handlers.ewf.bootstrap.best_ewfmount",
+                   return_value="/usr/local/bin/ewfmount"), \
+             patch("handlers.ewf.bootstrap.have_modern_libewf", return_value=True), \
+             patch("handlers.ewf.run_command"):
+            result = EwfHandler().mount(image, mp)
+
+        assert result.success is False
+        assert "empty" in (result.error or "").lower()
+
+    @pytest.mark.parametrize("ext", [".E01", ".Ex01"])
+    def test_physical_does_not_use_files_format(self, tmp_path, ext):
+        """E01/Ex01 mount in raw mode (no '-f files') and expose ewf1."""
+        image = tmp_path / f"evidence{ext}"
+        image.write_bytes(b"\x00")
+        mp = tmp_path / "container"
+        mp.mkdir()
+        (mp / "ewf1").write_bytes(b"\x00")
+
+        with patch("handlers.ewf.bootstrap.best_ewfmount",
+                   return_value="/usr/local/bin/ewfmount"), \
+             patch("handlers.ewf.bootstrap.have_modern_libewf", return_value=True), \
+             patch("handlers.ewf.run_command") as rc:
+            result = EwfHandler().mount(image, mp)
+
+        assert result.success is True
+        assert result.raw_image_path == mp / "ewf1"
+        cmd = rc.call_args.args[0]
+        assert "-f" not in cmd
+        assert cmd == ["/usr/local/bin/ewfmount", str(image), str(mp)]
