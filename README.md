@@ -26,7 +26,7 @@ cleanup is reliable, and speaks JSON for pipeline orchestration.
 | Format | Extensions | Primary tool | Fallback | Verified |
 | --- | --- | --- | --- | --- |
 | **E01 / L01** | `.e01`, `.l01` | `ewfmount` | – | ✅ |
-| **Ex01 / Lx01** *(EWF v2)* | `.ex01`, `.lx01` | `ewfmount` † | – | |
+| **Ex01 / Lx01** *(EWF v2)* | `.ex01`, `.lx01` | `ewfmount` † | – | ✅ |
 | **DD / Raw / IMG** | `.dd`, `.raw`, `.img`, `.bin`, `.001` | `losetup` | – | ✅ |
 | **VMDK** | `.vmdk` | `qemu-nbd` | `vmdkmount` | |
 | **VHD / VHDX** | `.vhd`, `.vhdx` | `qemu-nbd` | `vhdimount` | |
@@ -38,6 +38,8 @@ cleanup is reliable, and speaks JSON for pipeline orchestration.
 
 - **E01** — validated on both a single-volume **NTFS** image (no partition
   table) and a partitioned **ext4** Linux image.
+- **Ex01** *(EWF v2)* — validated end-to-end on a partitioned **XFS** Linux
+  server image with a FUSE-enabled modern libewf.
 - **DD / Raw / IMG** — validated via the `losetup` raw path.
 
 Unmarked formats are implemented and covered by the unit-test suite, but have
@@ -54,6 +56,12 @@ Detection uses the file extension first, then falls back to `file(1)` magic
 bytes, so correctly-formatted images with the wrong extension still mount.
 Multi-segment EWF sets (`.E01`/`.E02`/…) and split raw (`.001`/`.002`/…) are
 handled automatically — just point MountIR at the first segment.
+
+**Logical evidence files** (`.L01`/`.Lx01`) hold a reconstructed file/folder
+tree rather than a disk image, so MountIR mounts them with `ewfmount -f files`:
+the acquired files appear directly under the container mount and there is no
+partition table to enumerate. Physical images (`.E01`/`.Ex01`) instead expose a
+raw device (`ewf1`) that partition detection then walks.
 
 <details>
 <summary>Additional formats the engine also handles</summary>
@@ -156,13 +164,18 @@ install `colorama` yourself (optional; output just won't be coloured without it)
 ## Run `mountir` as a system command
 
 So you can call `mountir` from anywhere instead of `python3 /path/to/mountir.py`,
-put it on your `PATH`. **Recommended:** make the entry point executable and
-symlink it into `/usr/local/bin` (already on every user's `PATH`):
+put it on your `PATH`. **Recommended:** symlink the entry point into
+`/usr/local/bin` (already on every user's `PATH`):
 
 ```bash
-sudo chmod +x /opt/MountIR/mountir.py
+sudo chmod +x /opt/MountIR/mountir.py   # a fresh `git clone` already sets this;
+                                        # a mode-preserving copy can drop it
 sudo ln -s /opt/MountIR/mountir.py /usr/local/bin/mountir
 ```
+
+> **Tip:** deploy from a `git clone` (not a copy). A mode-preserving `rsync -p`/
+> `cp -p` can strip the executable bit and leave `mountir` as "command not
+> found"; a clone keeps it, and updates are just `sudo git -C /opt/MountIR pull`.
 
 The script's shebang (`#!/usr/bin/env python3`) and `__file__` resolution handle
 the rest — the symlink resolves back to the real project, finds its `.venv`, and
@@ -241,6 +254,8 @@ Installed automatically by `mountir setup`. The canonical mapping lives in
 | `pvs` | `lvm2` | LVM detection / activation |
 | `fusermount` | `fuse` | FUSE unmounting |
 | `ntfs-3g` | `ntfs-3g` | NTFS mounting |
+| `vmfs-fuse` | `vmfs-tools` | VMware **VMFS3/5** datastores |
+| `vmfs6-fuse` | `vmfs6-tools` | VMware **VMFS6** datastores (ESXi 6.5+; not in every distro's repos) |
 | `mmls` | `sleuthkit` | Partition layout |
 | `fdisk`, `blkid`, `losetup`, `mount` | `util-linux` | Loop devices, partitions, mounting |
 | `file` | `file` | Magic-byte format detection |
@@ -266,6 +281,11 @@ warns but never aborts setup:
 | `ewfmount` *(libewf)* | [libyal/libewf](https://github.com/libyal/libewf) | EWF v2 **Ex01/Lx01** — apt ships only the 2014 legacy line |
 
 The from-source `ewfmount` lands in `/usr/local/bin` and shadows the apt one.
+The build links **FUSE** (via `libfuse-dev`) so `ewfmount` can actually *mount*,
+not just read: `mountir setup` builds from a clean tree, forces the reliable
+**fuse2** path (libewf's fuse3 autodetect can produce a mount-incapable binary),
+and **verifies the built `ewfmount` links FUSE before reporting success** — a
+FUSE-less build is treated as a failure with the fix, never silently accepted.
 The libewf build is **pinned to `20240506`** for forensic reproducibility (you
 want to know exactly which tool version touched the evidence). To pull a
 different release, set the version and force a rebuild over the existing install:
@@ -278,8 +298,10 @@ sudo MOUNTIR_LIBEWF_VERSION=20240506 mountir setup --force
 > behaviour or fail to build. The pin is the tested default — only override it
 > if you specifically need another version.
 
-`mountir check` reports the `ewfmount` version, whether it can read Ex01/Lx01,
-and the **exact binary path** MountIR will invoke.
+`mountir check` reports the `ewfmount` version, whether it's **modern *and*
+FUSE-capable** (so Ex01/Lx01 can actually mount, not merely be read — a
+FUSE-less build is flagged as broken), the **exact binary path** MountIR will
+invoke, and per-driver filesystem coverage including **VMFS3/5** vs **VMFS6**.
 
 > **MountIR always uses the newest `ewfmount` it can find.** A source-built
 > modern `ewfmount` lands in `/usr/local/bin` alongside the frozen apt build in
